@@ -64,10 +64,34 @@ fi
 
 sam deploy "${DEPLOY_ARGS[@]}"
 
-# --- Write outputs.json from the stack's CloudFormation outputs ---
+# --- Fetch the stack's CloudFormation outputs (reused below) ---
 aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
   --query "Stacks[0].Outputs" --output json > /tmp/"${STACK_NAME}"-outputs.json
 
+# --- Sync the static self-service UI to S3 and invalidate the CloudFront cache ---
+if [ -d "ui" ]; then
+  UI_BUCKET="$(jq -r '.[] | select(.OutputKey=="UiSiteBucketName") | .OutputValue' /tmp/"${STACK_NAME}"-outputs.json)"
+  DISTRIBUTION_ID="$(jq -r '.[] | select(.OutputKey=="CloudFrontDistributionId") | .OutputValue' /tmp/"${STACK_NAME}"-outputs.json)"
+  API_URL="$(jq -r '.[] | select(.OutputKey=="ApiUrl") | .OutputValue' /tmp/"${STACK_NAME}"-outputs.json)"
+  USER_POOL_ID="$(jq -r '.[] | select(.OutputKey=="UserPoolId") | .OutputValue' /tmp/"${STACK_NAME}"-outputs.json)"
+  USER_POOL_CLIENT_ID="$(jq -r '.[] | select(.OutputKey=="UserPoolClientId") | .OutputValue' /tmp/"${STACK_NAME}"-outputs.json)"
+
+  aws s3 sync ui/ "s3://${UI_BUCKET}/" --region "$REGION" --delete
+
+  cat > /tmp/config.js <<EOF
+window.CRM_CONFIG = {
+  region: "${REGION}",
+  userPoolId: "${USER_POOL_ID}",
+  userPoolClientId: "${USER_POOL_CLIENT_ID}",
+  apiUrl: "${API_URL}",
+};
+EOF
+  aws s3 cp /tmp/config.js "s3://${UI_BUCKET}/config.js" --region "$REGION"
+
+  aws cloudfront create-invalidation --distribution-id "$DISTRIBUTION_ID" --paths "/*" >/dev/null
+fi
+
+# --- Write outputs.json from the stack's CloudFormation outputs ---
 jq 'reduce (. // [])[] as $o ({}; .[$o.OutputKey] = $o.OutputValue)
     | if has("AppUrl") then . + {app_url: .AppUrl} else . end' \
   /tmp/"${STACK_NAME}"-outputs.json > "$OUTPUTS_FILE"

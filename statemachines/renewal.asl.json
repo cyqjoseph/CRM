@@ -1,0 +1,73 @@
+{
+  "Comment": "ACM certificate auto-renewal workflow",
+  "StartAt": "RenewCertificate",
+  "States": {
+    "RenewCertificate": {
+      "Type": "Task",
+      "Resource": "${RenewalExecutorFunctionArn}",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "ResultPath": "$.renewalResult",
+      "Next": "WriteRenewalSuccessAudit",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "WriteRenewalFailureAudit"
+        }
+      ]
+    },
+    "WriteRenewalSuccessAudit": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Parameters": {
+        "TableName": "${AuditTableName}",
+        "Item": {
+          "EntityId": { "S.$": "$.certId" },
+          "EventTimestamp": { "S.$": "$$.State.EnteredTime" },
+          "EventType": { "S": "RENEWAL_COMPLETE" },
+          "Actor": { "S": "renewal-sfn" },
+          "Outcome": { "S": "SUCCESS" },
+          "Detail": { "S.$": "States.JsonToString($.renewalResult)" }
+        }
+      },
+      "Next": "PublishRenewalCompletion"
+    },
+    "PublishRenewalCompletion": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${CompletionsTopicArn}",
+        "Subject": "Certificate renewal complete",
+        "Message.$": "States.JsonToString($.renewalResult)"
+      },
+      "End": true
+    },
+    "WriteRenewalFailureAudit": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Parameters": {
+        "TableName": "${AuditTableName}",
+        "Item": {
+          "EntityId": { "S.$": "$.certId" },
+          "EventTimestamp": { "S.$": "$$.State.EnteredTime" },
+          "EventType": { "S": "RENEWAL_COMPLETE" },
+          "Actor": { "S": "renewal-sfn" },
+          "Outcome": { "S": "FAILURE" },
+          "Detail": { "S.$": "States.JsonToString($.error)" }
+        }
+      },
+      "Next": "RenewalFailed"
+    },
+    "RenewalFailed": {
+      "Type": "Fail",
+      "Error": "RenewalWorkflowFailed"
+    }
+  }
+}

@@ -1,0 +1,91 @@
+{
+  "Comment": "Scheduled discovery: ACM/Secrets Manager/IAM cert scan + Fargate AD discovery",
+  "StartAt": "Discover",
+  "States": {
+    "Discover": {
+      "Type": "Parallel",
+      "ResultPath": "$.discoveryResults",
+      "Branches": [
+        {
+          "StartAt": "DiscoverCerts",
+          "States": {
+            "DiscoverCerts": {
+              "Type": "Task",
+              "Resource": "${DiscoveryAcmFunctionArn}",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+                  "IntervalSeconds": 5,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "DiscoverAd",
+          "States": {
+            "DiscoverAd": {
+              "Type": "Task",
+              "Resource": "${DiscoveryAdTriggerFunctionArn}",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+                  "IntervalSeconds": 10,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "End": true
+            }
+          }
+        }
+      ],
+      "Next": "WriteDiscoverySuccessAudit",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "WriteDiscoveryFailureAudit"
+        }
+      ]
+    },
+    "WriteDiscoverySuccessAudit": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Parameters": {
+        "TableName": "${AuditTableName}",
+        "Item": {
+          "EntityId": { "S": "discovery-sfn" },
+          "EventTimestamp": { "S.$": "$$.State.EnteredTime" },
+          "EventType": { "S": "DISCOVERY_COMPLETE" },
+          "Actor": { "S": "discovery-sfn" },
+          "Outcome": { "S": "SUCCESS" }
+        }
+      },
+      "End": true
+    },
+    "WriteDiscoveryFailureAudit": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Parameters": {
+        "TableName": "${AuditTableName}",
+        "Item": {
+          "EntityId": { "S": "discovery-sfn" },
+          "EventTimestamp": { "S.$": "$$.State.EnteredTime" },
+          "EventType": { "S": "DISCOVERY_COMPLETE" },
+          "Actor": { "S": "discovery-sfn" },
+          "Outcome": { "S": "FAILURE" },
+          "Detail": { "S.$": "States.JsonToString($.error)" }
+        }
+      },
+      "Next": "DiscoveryFailed"
+    },
+    "DiscoveryFailed": {
+      "Type": "Fail",
+      "Error": "DiscoveryWorkflowFailed"
+    }
+  }
+}

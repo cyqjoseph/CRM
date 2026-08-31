@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Centralised Resource Manager</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Centralised Resource Manager</h1>
+      <div class="sub">Cross-environment certificate &amp; AD account lifecycle</div>
+    </div>
+    <div id="userBar" class="hidden">
+      <span id="userEmail" class="sub"></span>
+      &nbsp;
+      <span class="link" id="signOutLink">Sign out</span>
+    </div>
+  </header>
+
+  <main>
+    <section id="authView" class="auth-box">
+      <div class="card">
+        <h2 id="authTitle">Sign in</h2>
+        <div id="authError" class="error hidden"></div>
+        <div id="authMsg" class="msg hidden"></div>
+        <input id="authEmail" type="email" placeholder="Email" autocomplete="username" />
+        <input id="authPassword" type="password" placeholder="Password" autocomplete="current-password" />
+        <input id="authCode" type="text" placeholder="Verification code" class="hidden" />
+        <button id="authSubmit">Sign in</button>
+        <p style="text-align:center; margin-top: 12px;">
+          <span class="link" id="authToggle">Need an account? Sign up</span>
+        </p>
+      </div>
+    </section>
+
+    <section id="appView" class="hidden">
+      <div class="tabs">
+        <button class="tab active" data-tab="certs">Certificates</button>
+        <button class="tab" data-tab="ad">AD Accounts</button>
+        <button class="tab" data-tab="audit">Audit</button>
+      </div>
+
+      <div id="tab-certs" class="card">
+        <div id="certsError" class="error hidden"></div>
+        <table>
+          <thead>
+            <tr><th>Cert ID</th><th>Domain</th><th>Expiry</th><th>Status</th><th></th></tr>
+          </thead>
+          <tbody id="certsBody"></tbody>
+        </table>
+      </div>
+
+      <div id="tab-ad" class="card hidden">
+        <div id="adError" class="error hidden"></div>
+        <table>
+          <thead>
+            <tr><th>Account</th><th>Next rotation</th><th>Rotation status</th><th></th></tr>
+          </thead>
+          <tbody id="adBody"></tbody>
+        </table>
+      </div>
+
+      <div id="tab-audit" class="card hidden">
+        <input id="auditEntityId" placeholder="Entity ID (cert ID or account hash)" />
+        <button class="action" id="auditSearch">Search</button>
+        <div id="auditError" class="error hidden" style="margin-top:10px;"></div>
+        <table>
+          <thead>
+            <tr><th>Timestamp</th><th>Event</th><th>Outcome</th><th>Detail</th></tr>
+          </thead>
+          <tbody id="auditBody"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/amazon-cognito-identity-js@6.3.12/dist/amazon-cognito-identity.min.js"></script>
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

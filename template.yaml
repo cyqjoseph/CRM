@@ -1,0 +1,1269 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Centralised Resource Manager Cross-Environments — certificate and AD account
+  lifecycle discovery, expiry alerting, renewal/rotation, and a self-service
+  audited UI. See spec/ and docs/ for the approved requirements/design.
+
+Parameters:
+  AdAgentImageUri:
+    Type: String
+    Description: ECR image URI for the ad-agent Fargate container, built and pushed by deploy.sh.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-01d3b02b0f1c07aa0
+    Description: Existing account default VPC (per platform contract — never create a new one).
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Default: "subnet-0f43b5569d97d4bda,subnet-0f0834e47e6db3a6d,subnet-07a510b42806744f0"
+    Description: Existing public subnets (per platform contract — no NAT Gateway in this account).
+  JiraBaseUrl:
+    Type: String
+    Default: https://example.atlassian.net
+    Description: Base URL of the Jira Cloud instance tickets are created in.
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Timeout: 30
+    MemorySize: 256
+    Tracing: Active
+    PermissionsBoundary: arn:aws:iam::544635841962:policy/brd-architect-deploy-boundary
+    Layers:
+      - !Ref CommonLayer
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Shared Lambda layer
+  # ---------------------------------------------------------------------------
+  CommonLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: app-d9fae51c-1929cc69-common-layer
+      ContentUri: layers/common/
+      CompatibleRuntimes:
+        - python3.13
+    Metadata:
+      BuildMethod: python3.13
+
+  # ---------------------------------------------------------------------------
+  # DynamoDB inventory + audit tables
+  # ---------------------------------------------------------------------------
+  CertInventoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: app-d9fae51c-1929cc69-cert-inventory
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: CertId
+          AttributeType: S
+        - AttributeName: OwnerId
+          AttributeType: S
+        - AttributeName: ExpiryDate
+          AttributeType: S
+        - AttributeName: Status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: CertId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: OwnerIndex
+          KeySchema:
+            - AttributeName: OwnerId
+              KeyType: HASH
+            - AttributeName: ExpiryDate
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: ExpiryIndex
+          KeySchema:
+            - AttributeName: Status
+              KeyType: HASH
+            - AttributeName: ExpiryDate
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  AdInventoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: app-d9fae51c-1929cc69-ad-inventory
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: AccountIdHash
+          AttributeType: S
+        - AttributeName: OwnerId
+          AttributeType: S
+        - AttributeName: NextRotationDate
+          AttributeType: S
+        - AttributeName: RotationStatus
+          AttributeType: S
+      KeySchema:
+        - AttributeName: AccountIdHash
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: OwnerIndex
+          KeySchema:
+            - AttributeName: OwnerId
+              KeyType: HASH
+            - AttributeName: NextRotationDate
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: RotationIndex
+          KeySchema:
+            - AttributeName: RotationStatus
+              KeyType: HASH
+            - AttributeName: NextRotationDate
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  AuditHotTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: app-d9fae51c-1929cc69-audit-hot
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: EntityId
+          AttributeType: S
+        - AttributeName: EventTimestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: EntityId
+          KeyType: HASH
+        - AttributeName: EventTimestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ExpiresAt
+        Enabled: true
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+
+  # ---------------------------------------------------------------------------
+  # S3: audit archive + self-service UI static site
+  # ---------------------------------------------------------------------------
+  AuditArchiveBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: app-d9fae51c-1929cc69-audit-archive
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ad-account-retention-7yr
+            Status: Enabled
+            Prefix: ad-account/
+            ExpirationInDays: 2555
+          - Id: cert-retention-3yr
+            Status: Enabled
+            Prefix: cert/
+            ExpirationInDays: 1095
+
+  UiSiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: app-d9fae51c-1929cc69-ui-site
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  UiOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: app-d9fae51c-1929cc69-ui-oac
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  UiDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: app-d9fae51c-1929cc69-ui-cdn
+        Enabled: true
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: ui-site-origin
+            DomainName: !GetAtt UiSiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt UiOAC.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: ui-site-origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # AWS managed: CachingOptimized
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  UiSiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref UiSiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${UiSiteBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${UiDistribution}"
+
+  # ---------------------------------------------------------------------------
+  # Cognito: self-signup user pool with owner/admin groups
+  # ---------------------------------------------------------------------------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: app-d9fae51c-1929cc69-userpool
+      MfaConfiguration: OFF
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: app-d9fae51c-1929cc69-userpool-client
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+
+  UserPoolOwnersGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: owners
+      UserPoolId: !Ref UserPool
+
+  UserPoolAdminsGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: admins
+      UserPoolId: !Ref UserPool
+
+  # ---------------------------------------------------------------------------
+  # API Gateway
+  # ---------------------------------------------------------------------------
+  CrmApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: app-d9fae51c-1929cc69-api
+      StageName: prod
+      TracingEnabled: true
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+
+  # ---------------------------------------------------------------------------
+  # SNS topics + SQS queues
+  # ---------------------------------------------------------------------------
+  AlertsLowTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: app-d9fae51c-1929cc69-alerts-low
+
+  AlertsMediumTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: app-d9fae51c-1929cc69-alerts-medium
+
+  AlertsHighTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: app-d9fae51c-1929cc69-alerts-high
+
+  CompletionsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: app-d9fae51c-1929cc69-completions
+
+  OpsAlarmsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: app-d9fae51c-1929cc69-ops-alarms
+
+  JiraDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: app-d9fae51c-1929cc69-jira-dlq
+      MessageRetentionPeriod: 1209600
+
+  JiraQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: app-d9fae51c-1929cc69-jira-queue
+      VisibilityTimeout: 60
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt JiraDlq.Arn
+        maxReceiveCount: 3
+
+  # ---------------------------------------------------------------------------
+  # Secrets Manager + SSM
+  # ---------------------------------------------------------------------------
+  AdBindSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: app-d9fae51c-1929cc69-ad-bind-creds
+      Description: On-prem AD bind service-account credentials used by the ad-agent Fargate task.
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"svc-crm-bind"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+
+  JiraTokenSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: app-d9fae51c-1929cc69-jira-token
+      Description: Jira Cloud API token used by the jira-notifier function. Replace the placeholder after deploy.
+      SecretString: '{"token":"REPLACE_ME"}'
+
+  ThresholdLowParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /app-d9fae51c-1929cc69/thresholds/low
+      Type: String
+      Value: "30"
+
+  ThresholdMediumParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /app-d9fae51c-1929cc69/thresholds/medium
+      Type: String
+      Value: "14"
+
+  ThresholdHighParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /app-d9fae51c-1929cc69/thresholds/high
+      Type: String
+      Value: "7"
+
+  PolicyAutoRenewAcmParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /app-d9fae51c-1929cc69/policy/auto-renew-acm
+      Type: String
+      Value: "true"
+
+  PolicyRotationIntervalDaysParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /app-d9fae51c-1929cc69/policy/rotation-interval-days
+      Type: String
+      Value: "90"
+
+  # ---------------------------------------------------------------------------
+  # ECS Fargate: on-prem AD discovery/rotation task
+  # ---------------------------------------------------------------------------
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: app-d9fae51c-1929cc69-cluster
+
+  AdTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: app-d9fae51c-1929cc69-ad-task-sg
+      GroupDescription: Egress-only security group for the ad-agent Fargate task (no inbound needed).
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: AWS API calls (ECR pull, DynamoDB, Secrets Manager)
+        - IpProtocol: tcp
+          FromPort: 636
+          ToPort: 636
+          CidrIp: 0.0.0.0/0
+          Description: LDAPS to on-prem AD
+
+  AdTaskLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/app-d9fae51c-1929cc69-ad-agent
+      RetentionInDays: 30
+
+  AdTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: app-d9fae51c-1929cc69-ad-task-exec-role
+      PermissionsBoundary: arn:aws:iam::544635841962:policy/brd-architect-deploy-boundary
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ad-task-exec-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/app-d9fae51c-1929cc69-ad-agent"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt AdTaskLogGroup.Arn
+
+  AdTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: app-d9fae51c-1929cc69-ad-task-role
+      PermissionsBoundary: arn:aws:iam::544635841962:policy/brd-architect-deploy-boundary
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ad-task-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref AdBindSecret
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt AdInventoryTable.Arn
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt AuditHotTable.Arn
+
+  AdTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: app-d9fae51c-1929cc69-ad-task-def
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "512"
+      ExecutionRoleArn: !GetAtt AdTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt AdTaskRole.Arn
+      ContainerDefinitions:
+        - Name: ad-agent
+          Image: !Ref AdAgentImageUri
+          Essential: true
+          Environment:
+            - Name: AD_TABLE_NAME
+              Value: !Ref AdInventoryTable
+            - Name: AUDIT_TABLE_NAME
+              Value: !Ref AuditHotTable
+            - Name: AD_BIND_SECRET_ARN
+              Value: !Ref AdBindSecret
+            - Name: AD_DOMAIN
+              Value: corp.example.internal
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AdTaskLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ad-agent
+
+  # ---------------------------------------------------------------------------
+  # Lambda functions
+  # ---------------------------------------------------------------------------
+  DiscoveryAcmFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: app-d9fae51c-1929cc69-discovery-acm-fn
+      CodeUri: functions/discovery_acm/
+      Handler: app.handler
+      Environment:
+        Variables:
+          CERT_TABLE_NAME: !Ref CertInventoryTable
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref CertInventoryTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - acm:ListCertificates
+                - acm:DescribeCertificate
+                - secretsmanager:ListSecrets
+                - secretsmanager:DescribeSecret
+                - iam:ListServerCertificates
+              Resource: "*"
+
+  DiscoveryAdTriggerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: app-d9fae51c-1929cc69-discovery-ad-trigger-fn
+      CodeUri: functions/discovery_ad_trigger/
+      Handler: app.handler
+      Timeout: 900
+      Environment:
+        Variables:
+          ECS_CLUSTER_ARN: !GetAtt EcsCluster.Arn
+          AD_TASK_DEFINITION: !Ref AdTaskDefinition
+          SUBNET_IDS: !Join [",", !Ref SubnetIds]
+          AD_TASK_SECURITY_GROUP_ID: !GetAtt AdTaskSecurityGroup.GroupId
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: ecs:RunTask
+              Resource: !Ref AdTaskDefinition
+            - Effect: Allow
+              Action:
+                - ecs:DescribeTasks
+                - ecs:StopTask
+              Resource: !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task/app-d9fae51c-1929cc69-cluster/*"
+            - Effect: Allow
+              Action: iam:PassRole
+              Resource:
+                - !GetAtt AdTaskExecutionRole.Arn
+                - !GetAtt AdTaskRole.Arn
+
+  ExpiryEvaluatorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: app-d9fae51c-1929cc69-expiry-evaluator-fn
+      CodeUri: functions/expiry_evaluator/
+      Handler: app.handler
+      Environment:
+        Variables:
+          CERT_TABLE_NAME: !Ref CertInventoryTable
+          AD_TABLE_NAME: !Ref AdInventoryTable
+          AUDIT_TABLE_NAME: !Ref AuditHotTable
+          JIRA_QUEUE_URL: !Ref JiraQueue
+          SNS_TOPIC_LOW: !Ref AlertsLowTopic
+          SNS_TOPIC_MEDIUM: !Ref AlertsMediumTopic
+          SNS_TOPIC_HIGH: !Ref AlertsHighTopic
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref CertInventoryTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref AdInventoryTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref AuditHotTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt AlertsLowTopic.TopicName
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt AlertsMediumTopic.TopicName
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt AlertsHighTopic.TopicName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt JiraQueue.QueueName
+
+  RenewalExecutorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: app-d9fae51c-1929cc69-renewal-executor-fn
+      CodeUri: functions/renewal_executor/
+      Handler: app.handler
+      Environment:
+        Variables:
+          CERT_TABLE_NAME: !Ref CertInventoryTable
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref CertInventoryTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - acm:RenewCertificate
+                - acm:DescribeCertificate
+              Resource: !Sub "arn:aws:acm:${AWS::Region}:${AWS::AccountId}:certificate/*"
+
+  JiraNotifierFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: app-d9fae51c-1929cc69-jira-notifier-fn
+      CodeUri: functions/jira_notifier/
+      Handler: app.handler
+      Environment:
+        Variables:
+          JIRA_TOKEN_SECRET_ARN: !Ref JiraTokenSecret
+          JIRA_BASE_URL: !Ref JiraBaseUrl
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref JiraTokenSecret
+      Events:
+        JiraQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt JiraQueue.Arn
+            BatchSize: 1
+
+  ApiCertsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: app-d9fae51c-1929cc69-api-certs-fn
+      CodeUri: functions/api_certs/
+      Handler: app.handler
+      Environment:
+        Variables:
+          CERT_TABLE_NAME: !Ref CertInventoryTable
+          AUDIT_TABLE_NAME: !Ref AuditHotTable
+          RENEWAL_STATE_MACHINE_ARN: !Ref RenewalSfn
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref CertInventoryTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref AuditHotTable
+        - Statement:
+            - Effect: Allow
+              Action: states:StartExecution
+              Resource: !Ref RenewalSfn
+      Events:
+        ListCerts:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CrmApi
+            Path: /certs
+            Method: get
+        GetCert:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CrmApi
+            Path: /certs/{certId}
+            Method: get
+        RenewCert:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CrmApi
+            Path: /certs/{certId}/renew
+            Method: post
+
+  ApiAdFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: app-d9fae51c-1929cc69-api-ad-fn
+      CodeUri: functions/api_ad/
+      Handler: app.handler
+      Environment:
+        Variables:
+          AD_TABLE_NAME: !Ref AdInventoryTable
+          AUDIT_TABLE_NAME: !Ref AuditHotTable
+          ROTATION_STATE_MACHINE_ARN: !Ref RotationSfn
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref AdInventoryTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref AuditHotTable
+        - Statement:
+            - Effect: Allow
+              Action: states:StartExecution
+              Resource: !Ref RotationSfn
+      Events:
+        ListAdAccounts:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CrmApi
+            Path: /ad-accounts
+            Method: get
+        GetAdAccount:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CrmApi
+            Path: /ad-accounts/{accountId}
+            Method: get
+        RotateAdAccount:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CrmApi
+            Path: /ad-accounts/{accountId}/rotate
+            Method: post
+
+  ApiAuditFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: app-d9fae51c-1929cc69-api-audit-fn
+      CodeUri: functions/api_audit/
+      Handler: app.handler
+      Environment:
+        Variables:
+          AUDIT_TABLE_NAME: !Ref AuditHotTable
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref AuditHotTable
+        - Statement:
+            - Effect: Allow
+              Action: states:DescribeExecution
+              Resource:
+                - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${DiscoverySfn.Name}:*"
+                - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${RenewalSfn.Name}:*"
+                - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${RotationSfn.Name}:*"
+      Events:
+        GetAudit:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CrmApi
+            Path: /audit
+            Method: get
+        GetExecution:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CrmApi
+            Path: /executions/{executionId}
+            Method: get
+
+  AuditExporterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: app-d9fae51c-1929cc69-audit-exporter-fn
+      CodeUri: functions/audit_exporter/
+      Handler: app.handler
+      Environment:
+        Variables:
+          ARCHIVE_BUCKET_NAME: !Ref AuditArchiveBucket
+      Policies:
+        - S3WritePolicy:
+            BucketName: !Ref AuditArchiveBucket
+      Events:
+        AuditStream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt AuditHotTable.StreamArn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 10
+
+  # ---------------------------------------------------------------------------
+  # Step Functions state machines
+  # ---------------------------------------------------------------------------
+  DiscoverySfnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: app-d9fae51c-1929cc69-discovery-sfn-role
+      PermissionsBoundary: arn:aws:iam::544635841962:policy/brd-architect-deploy-boundary
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub "states.${AWS::Region}.amazonaws.com"
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: discovery-sfn-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt DiscoveryAcmFunction.Arn
+                  - !GetAtt DiscoveryAdTriggerFunction.Arn
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt AuditHotTable.Arn
+
+  DiscoverySfn:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: app-d9fae51c-1929cc69-discovery-sfn
+      DefinitionUri: statemachines/discovery.asl.json
+      DefinitionSubstitutions:
+        DiscoveryAcmFunctionArn: !GetAtt DiscoveryAcmFunction.Arn
+        DiscoveryAdTriggerFunctionArn: !GetAtt DiscoveryAdTriggerFunction.Arn
+        AuditTableName: !Ref AuditHotTable
+      Role: !GetAtt DiscoverySfnRole.Arn
+      Tracing:
+        Enabled: true
+
+  RenewalSfnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: app-d9fae51c-1929cc69-renewal-sfn-role
+      PermissionsBoundary: arn:aws:iam::544635841962:policy/brd-architect-deploy-boundary
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub "states.${AWS::Region}.amazonaws.com"
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: renewal-sfn-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt RenewalExecutorFunction.Arn
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt AuditHotTable.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref CompletionsTopic
+
+  RenewalSfn:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: app-d9fae51c-1929cc69-renewal-sfn
+      DefinitionUri: statemachines/renewal.asl.json
+      DefinitionSubstitutions:
+        RenewalExecutorFunctionArn: !GetAtt RenewalExecutorFunction.Arn
+        AuditTableName: !Ref AuditHotTable
+        CompletionsTopicArn: !Ref CompletionsTopic
+      Role: !GetAtt RenewalSfnRole.Arn
+      Tracing:
+        Enabled: true
+
+  RotationSfnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: app-d9fae51c-1929cc69-rotation-sfn-role
+      PermissionsBoundary: arn:aws:iam::544635841962:policy/brd-architect-deploy-boundary
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub "states.${AWS::Region}.amazonaws.com"
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: rotation-sfn-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ecs:RunTask
+                Resource: !Ref AdTaskDefinition
+              - Effect: Allow
+                Action:
+                  - ecs:StopTask
+                  - ecs:DescribeTasks
+                Resource: !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task/app-d9fae51c-1929cc69-cluster/*"
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !GetAtt AdTaskExecutionRole.Arn
+                  - !GetAtt AdTaskRole.Arn
+              - Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource: !GetAtt AdInventoryTable.Arn
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt AuditHotTable.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref CompletionsTopic
+              - Effect: Allow
+                Action:
+                  - events:PutTargets
+                  - events:PutRule
+                  - events:DescribeRule
+                Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForECSTaskRule"
+
+  RotationSfn:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: app-d9fae51c-1929cc69-rotation-sfn
+      DefinitionUri: statemachines/rotation.asl.json
+      DefinitionSubstitutions:
+        EcsClusterArn: !GetAtt EcsCluster.Arn
+        AdTaskDefinitionArn: !Ref AdTaskDefinition
+        SubnetIdsJson: !Sub
+          - '["${SubnetsList}"]'
+          - SubnetsList: !Join ['","', !Ref SubnetIds]
+        AdTaskSecurityGroupId: !GetAtt AdTaskSecurityGroup.GroupId
+        AdTableName: !Ref AdInventoryTable
+        AuditTableName: !Ref AuditHotTable
+        CompletionsTopicArn: !Ref CompletionsTopic
+      Role: !GetAtt RotationSfnRole.Arn
+      Tracing:
+        Enabled: true
+
+  # ---------------------------------------------------------------------------
+  # EventBridge schedules
+  # ---------------------------------------------------------------------------
+  EventBridgeSfnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: app-d9fae51c-1929cc69-eventbridge-sfn-role
+      PermissionsBoundary: arn:aws:iam::544635841962:policy/brd-architect-deploy-boundary
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: start-discovery-execution
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref DiscoverySfn
+
+  DiscoveryScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: app-d9fae51c-1929cc69-discovery-daily
+      ScheduleExpression: rate(1 day)
+      State: ENABLED
+      Targets:
+        - Id: DiscoverySfnTarget
+          Arn: !Ref DiscoverySfn
+          RoleArn: !GetAtt EventBridgeSfnRole.Arn
+
+  ExpiryScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: app-d9fae51c-1929cc69-expiry-hourly
+      ScheduleExpression: rate(1 hour)
+      State: ENABLED
+      Targets:
+        - Id: ExpiryEvaluatorTarget
+          Arn: !GetAtt ExpiryEvaluatorFunction.Arn
+
+  ExpiryEvaluatorInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ExpiryEvaluatorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ExpiryScheduleRule.Arn
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch dashboard + alarms
+  # ---------------------------------------------------------------------------
+  JiraDlqDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: app-d9fae51c-1929cc69-jira-dlq-depth
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt JiraDlq.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref OpsAlarmsTopic
+
+  DiscoverySfnFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: app-d9fae51c-1929cc69-discovery-sfn-failed
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref DiscoverySfn
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref OpsAlarmsTopic
+
+  RenewalSfnFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: app-d9fae51c-1929cc69-renewal-sfn-failed
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref RenewalSfn
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref OpsAlarmsTopic
+
+  RotationSfnFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: app-d9fae51c-1929cc69-rotation-sfn-failed
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref RotationSfn
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref OpsAlarmsTopic
+
+  LambdaErrorAlarmDiscoveryAcm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: app-d9fae51c-1929cc69-discovery-acm-fn-errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DiscoveryAcmFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref OpsAlarmsTopic
+
+  LambdaErrorAlarmDiscoveryAdTrigger:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: app-d9fae51c-1929cc69-discovery-ad-trigger-fn-errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DiscoveryAdTriggerFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref OpsAlarmsTopic
+
+  LambdaErrorAlarmExpiryEvaluator:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: app-d9fae51c-1929cc69-expiry-evaluator-fn-errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ExpiryEvaluatorFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref OpsAlarmsTopic
+
+  LambdaErrorAlarmRenewalExecutor:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: app-d9fae51c-1929cc69-renewal-executor-fn-errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref RenewalExecutorFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref OpsAlarmsTopic
+
+  LambdaErrorAlarmJiraNotifier:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: app-d9fae51c-1929cc69-jira-notifier-fn-errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref JiraNotifierFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref OpsAlarmsTopic
+
+  LambdaErrorAlarmApiCerts:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: app-d9fae51c-1929cc69-api-certs-fn-errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ApiCertsFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref OpsAlarmsTopic
+
+  LambdaErrorAlarmApiAd:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: app-d9fae51c-1929cc69-api-ad-fn-errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ApiAdFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref OpsAlarmsTopic
+
+  LambdaErrorAlarmApiAudit:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: app-d9fae51c-1929cc69-api-audit-fn-errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ApiAuditFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref OpsAlarmsTopic
+
+  LambdaErrorAlarmAuditExporter:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: app-d9fae51c-1929cc69-audit-exporter-fn-errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AuditExporterFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref OpsAlarmsTopic
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: app-d9fae51c-1929cc69-dashboard
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "Lambda errors",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  ["AWS/Lambda", "Errors", "FunctionName", "${DiscoveryAcmFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${DiscoveryAdTriggerFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${ExpiryEvaluatorFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${RenewalExecutorFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${JiraNotifierFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${ApiCertsFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${ApiAdFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${ApiAuditFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${AuditExporterFunction}"]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "Step Functions failed executions",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  ["AWS/States", "ExecutionsFailed", "StateMachineArn", "${DiscoverySfn}"],
+                  ["AWS/States", "ExecutionsFailed", "StateMachineArn", "${RenewalSfn}"],
+                  ["AWS/States", "ExecutionsFailed", "StateMachineArn", "${RotationSfn}"]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Jira DLQ depth",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${JiraDlq.QueueName}"]
+                ]
+              }
+            }
+          ]
+        }
+
+Outputs:
+  AppUrl:
+    Description: Self-service UI (CloudFront)
+    Value: !Sub "https://${UiDistribution.DomainName}"
+  ApiUrl:
+    Description: REST API base URL
+    Value: !Sub "https://${CrmApi}.execute-api.${AWS::Region}.amazonaws.com/prod/"
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  UiSiteBucketName:
+    Value: !Ref UiSiteBucket
+  CloudFrontDistributionId:
+    Value: !Ref UiDistribution
+  CertInventoryTableName:
+    Value: !Ref CertInventoryTable
+  AdInventoryTableName:
+    Value: !Ref AdInventoryTable
+  AuditHotTableName:
+    Value: !Ref AuditHotTable

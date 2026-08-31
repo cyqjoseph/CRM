@@ -1,0 +1,103 @@
+{
+  "Comment": "AD account credential rotation workflow via Fargate task",
+  "StartAt": "RunAdRotationTask",
+  "States": {
+    "RunAdRotationTask": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
+      "Parameters": {
+        "Cluster": "${EcsClusterArn}",
+        "TaskDefinition": "${AdTaskDefinitionArn}",
+        "LaunchType": "FARGATE",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "Subnets": ${SubnetIdsJson},
+            "SecurityGroups": ["${AdTaskSecurityGroupId}"],
+            "AssignPublicIp": "ENABLED"
+          }
+        },
+        "Overrides": {
+          "ContainerOverrides": [
+            {
+              "Name": "ad-agent",
+              "Environment": [
+                { "Name": "AD_TASK_MODE", "Value": "ROTATE" },
+                { "Name": "ROTATION_ACCOUNT_HASH.$", "Value.$": "$.accountIdHash" }
+              ]
+            }
+          ]
+        }
+      },
+      "ResultPath": "$.rotationTask",
+      "Next": "UpdateAdInventory",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "WriteRotationFailureAudit"
+        }
+      ]
+    },
+    "UpdateAdInventory": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${AdTableName}",
+        "Key": {
+          "AccountIdHash": { "S.$": "$.accountIdHash" }
+        },
+        "UpdateExpression": "SET RotationStatus = :status",
+        "ExpressionAttributeValues": {
+          ":status": { "S": "ACTIVE" }
+        }
+      },
+      "ResultPath": "$.inventoryUpdate",
+      "Next": "WriteRotationSuccessAudit"
+    },
+    "WriteRotationSuccessAudit": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Parameters": {
+        "TableName": "${AuditTableName}",
+        "Item": {
+          "EntityId": { "S.$": "$.accountIdHash" },
+          "EventTimestamp": { "S.$": "$$.State.EnteredTime" },
+          "EventType": { "S": "ROTATION_COMPLETE" },
+          "Actor": { "S": "rotation-sfn" },
+          "Outcome": { "S": "SUCCESS" }
+        }
+      },
+      "Next": "PublishRotationCompletion"
+    },
+    "PublishRotationCompletion": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${CompletionsTopicArn}",
+        "Subject": "AD account rotation complete",
+        "Message.$": "States.Format('accountIdHash={} status=SUCCESS', $.accountIdHash)"
+      },
+      "End": true
+    },
+    "WriteRotationFailureAudit": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Parameters": {
+        "TableName": "${AuditTableName}",
+        "Item": {
+          "EntityId": { "S.$": "$.accountIdHash" },
+          "EventTimestamp": { "S.$": "$$.State.EnteredTime" },
+          "EventType": { "S": "ROTATION_COMPLETE" },
+          "Actor": { "S": "rotation-sfn" },
+          "Outcome": { "S": "FAILURE" },
+          "Detail": { "S.$": "States.JsonToString($.error)" }
+        }
+      },
+      "Next": "RotationFailed"
+    },
+    "RotationFailed": {
+      "Type": "Fail",
+      "Error": "RotationWorkflowFailed"
+    }
+  }
+}
