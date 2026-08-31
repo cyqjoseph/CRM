@@ -237,7 +237,10 @@ Resources:
     Type: AWS::Cognito::UserPool
     Properties:
       UserPoolName: app-d9fae51c-1929cc69-userpool
-      MfaConfiguration: OFF
+      # Must stay quoted: bare OFF is a YAML 1.1 boolean alias, so CloudFormation
+      # would send the string 'false' and Cognito rejects it — its enum is
+      # [OPTIONAL, OFF, ON].
+      MfaConfiguration: "OFF"
       UsernameAttributes:
         - email
       AutoVerifiedAttributes:

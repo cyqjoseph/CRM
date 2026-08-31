@@ -168,6 +168,52 @@ def test_resource_names_use_the_mandated_prefix():
                 )
 
 
+def test_mfa_configuration_is_the_string_off_not_a_boolean():
+    """Cognito's MfaConfiguration enum is [OPTIONAL, OFF, ON] — all strings.
+
+    Bare `OFF` is a YAML 1.1 boolean alias, so `MfaConfiguration: OFF` parses as
+    False and CloudFormation sends the string 'false', which fails validation
+    with "Value 'false' at 'mfaConfiguration' failed to satisfy constraint".
+    It must be quoted.
+    """
+    mfa = RESOURCES["UserPool"]["Properties"]["MfaConfiguration"]
+    assert not isinstance(mfa, bool), (
+        "MfaConfiguration parsed as a boolean — quote it as \"OFF\" so it stays "
+        "the string Cognito's enum requires"
+    )
+    assert mfa == "OFF"
+
+
+# YAML 1.1 resolves all of these bare words to booleans. CloudFormation applies
+# that resolution too, so any of them left unquoted silently becomes true/false
+# and is sent to the service as the string 'true'/'false' — which fails only at
+# CREATE time, inside the deploy. Lowercase true/false are unambiguous and fine.
+YAML11_BOOLEAN_ALIASES = {
+    "y", "yes", "n", "no", "on", "off",
+    "Y", "Yes", "YES", "N", "No", "NO", "On", "ON", "Off", "OFF",
+    "True", "TRUE", "False", "FALSE",
+}
+
+
+def test_no_unquoted_yaml_boolean_aliases_in_the_template():
+    offenders = []
+    for lineno, line in enumerate(
+        (ROOT / "template.yaml").read_text().splitlines(), start=1
+    ):
+        stripped = line.strip()
+        if stripped.startswith("#") or ":" not in stripped:
+            continue
+        value = stripped.split(":", 1)[1].strip()
+        if value.split("#", 1)[0].strip() in YAML11_BOOLEAN_ALIASES:
+            offenders.append(f"template.yaml:{lineno}: {stripped}")
+
+    assert not offenders, (
+        "these values are YAML 1.1 boolean aliases and will be coerced to "
+        "true/false — quote them if the service expects a string:\n"
+        + "\n".join(offenders)
+    )
+
+
 def test_ssm_parameters_live_under_the_mandated_path():
     path_prefix = "/app-d9fae51c-1929cc69/"
     for logical_id, resource in RESOURCES.items():

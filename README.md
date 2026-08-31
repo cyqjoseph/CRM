@@ -64,6 +64,37 @@ values, and invalidates the CloudFront cache. `destroy.sh` tears everything
 down, including the two resources CloudFormation never owns: the ECR
 repository and the S3 buckets' contents.
 
+### Re-deploy safety: Secrets Manager's recovery window
+
+`DeleteStack` does **not** purge an `AWS::SecretsManager::Secret` — it only
+schedules deletion behind a recovery window (30 days by default), and the
+secret's name stays reserved for that entire window. A later deploy that
+re-creates the same name therefore fails immediately with *"already scheduled
+for deletion"*.
+
+This one is unusually hard to diagnose. `AdBindSecret` and `JiraTokenSecret`
+have no dependencies, so CloudFormation creates them in its **first** wave,
+next to the DynamoDB tables, S3 buckets, SNS topics and SQS queues. When a
+first-wave resource fails, every sibling in that wave is stamped only
+`Resource creation cancelled` — so the build log shows a large cascade of
+cancellations and no root cause.
+
+Both scripts now handle it:
+
+- `destroy.sh` purges the secrets outright (`restore-secret`, then
+  `delete-secret --force-delete-without-recovery`) **after** `DeleteStack`, so
+  the blocking state is never left behind. The restore step is required —
+  `--force-delete-without-recovery` is rejected on a secret that is already
+  scheduled for deletion.
+- `deploy.sh` runs the same reconciliation as a **preflight**, before
+  `sam deploy`, so a retry recovers even if `destroy.sh` never ran or failed
+  part-way. A secret that is absent, or live and owned by the stack, is left
+  untouched.
+- `deploy.sh` also prints the **root** CloudFormation failures on any deploy
+  failure (`describe-stack-events`, filtering out the
+  `Resource creation cancelled` boilerplate), so a first-wave failure names
+  itself instead of hiding behind the cascade.
+
 ## Deviations from `spec/`
 
 The spec was written against a `{env}-crm-*` naming convention and a
@@ -99,7 +130,15 @@ parses `template.yaml` with a small custom YAML loader (handles CFN's
 test can't: every required API route is wired up, tracing is enabled
 everywhere, no IAM statement grants a wildcard `Resource` outside AWS's
 documented cases, `iam:PassRole` is always scoped to named role ARNs, and
-every resource name/SSM path carries the mandated prefix.
+every resource name/SSM path carries the mandated prefix (including
+`LogGroupName` — a log group named `/ecs/app-...` previously slipped past this
+check because that property wasn't in the list).
+
+`test_scripts.py` covers `deploy.sh`/`destroy.sh`: that both handle every
+secret in `template.yaml`, that the purge runs before `sam deploy` and after
+`DeleteStack` respectively, that a failed deploy reports root failures rather
+than cancellations, and that neither script reaches for SAM's shared
+`aws-sam-cli-managed-default` bucket.
 
 Run with:
 
