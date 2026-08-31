@@ -10,8 +10,9 @@
 # Exits non-zero on the first failed check.
 set -euo pipefail
 
+cd "$(dirname "$0")/.."
+
 REGION="ap-southeast-1"
-OUTPUTS_FILE="outputs.json"
 TEST_EMAIL="${TEST_EMAIL:-crm-validate@example.com}"
 TEST_PASSWORD="${TEST_PASSWORD:-ValidateCrm123!}"
 CERT_TABLE="app-d9fae51c-1929cc69-cert-inventory"
@@ -21,20 +22,13 @@ pass() { printf '  \033[32mPASS\033[0m  %s\n' "$1"; }
 fail() { printf '  \033[31mFAIL\033[0m  %s\n' "$1" >&2; exit 1; }
 step() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 
-if [ ! -f "$OUTPUTS_FILE" ]; then
-  fail "$OUTPUTS_FILE not found — run ./deploy.sh first"
-fi
-
-API_URL="$(jq -r '.ApiUrl' "$OUTPUTS_FILE")"
-APP_URL="$(jq -r '.app_url // .AppUrl' "$OUTPUTS_FILE")"
-USER_POOL_ID="$(jq -r '.UserPoolId' "$OUTPUTS_FILE")"
-CLIENT_ID="$(jq -r '.UserPoolClientId' "$OUTPUTS_FILE")"
-
-for pair in "ApiUrl:$API_URL" "UserPoolId:$USER_POOL_ID" "UserPoolClientId:$CLIENT_ID"; do
-  [ -n "${pair#*:}" ] && [ "${pair#*:}" != "null" ] || fail "${pair%%:*} missing from $OUTPUTS_FILE"
-done
-
-API_URL="${API_URL%/}"
+# Resolves API_URL / APP_URL / USER_POOL_ID / USER_POOL_CLIENT_ID from
+# outputs.json when present, and from CloudFormation when it is not — which is
+# the normal case, since this project deploys on push and outputs.json is
+# gitignored, so ./deploy.sh never runs on your machine.
+# shellcheck source=scripts/lib-stack-outputs.sh
+source scripts/lib-stack-outputs.sh
+CLIENT_ID="$USER_POOL_CLIENT_ID"
 
 step "1. Static site is served"
 UI_STATUS="$(curl -s -o /dev/null -w '%{http_code}' "$APP_URL/")"

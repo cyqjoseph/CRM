@@ -13,7 +13,18 @@ CERT_TABLE_NAME = os.environ["CERT_TABLE_NAME"]
 # Fields we are allowed to write. Anything not in this allow-list is dropped
 # before the PutItem call, so a code change elsewhere can never smuggle a
 # plaintext secret field (e.g. SecretValue/PrivateKey) into the table.
-ALLOWED_FIELDS = {"CertId", "CertType", "OwnerId", "ExpiryDate", "Status", "Source", "Version"}
+# `Domain` is lifecycle metadata, not key material, and the UI renders it as its
+# own column — without it every discovered row shows a blank Domain cell.
+ALLOWED_FIELDS = {
+    "CertId",
+    "CertType",
+    "OwnerId",
+    "Domain",
+    "ExpiryDate",
+    "Status",
+    "Source",
+    "Version",
+}
 
 
 def _sanitize(item):
@@ -32,6 +43,7 @@ def _discover_acm_certs(acm_client):
                     "CertId": cert["CertificateArn"],
                     "CertType": "ACM",
                     "OwnerId": cert.get("DomainName", "unknown"),
+                    "Domain": cert.get("DomainName", ""),
                     "ExpiryDate": cert.get("NotAfter").isoformat() if cert.get("NotAfter") else None,
                     "Status": cert.get("Status", "UNKNOWN"),
                     "Source": "acm",

@@ -221,6 +221,17 @@
 
   // --- Audit ---
 
+  // Detail is a DynamoDB map (crm_common.put_audit_event writes a dict, and the
+  // Step Functions putItem states write one too), so interpolating it directly
+  // renders the literal string "[object Object]" for every row.
+  function formatDetail(detail) {
+    if (!detail) return "";
+    if (typeof detail === "string") return detail;
+    return Object.entries(detail)
+      .map(([k, v]) => `${k}: ${typeof v === "object" ? JSON.stringify(v) : v}`)
+      .join(", ");
+  }
+
   el("auditSearch").addEventListener("click", async () => {
     setError("auditError", null);
     const entityId = el("auditEntityId").value.trim();
@@ -233,7 +244,7 @@
             <td>${e.EventTimestamp}</td>
             <td>${e.EventType}</td>
             <td>${e.Outcome}</td>
-            <td>${e.Detail || ""}</td>
+            <td>${formatDetail(e.Detail)}</td>
           </tr>`
         )
         .join("");

@@ -121,6 +121,59 @@ authoritative. Concretely:
   condition has no per-caller identity to key off; the application-level
   check achieves the same isolation.
 
+## Validating a deployment
+
+Both scripts resolve the stack's outputs themselves (`scripts/lib-stack-outputs.sh`),
+preferring a local `outputs.json` and falling back to CloudFormation. That
+fallback is the normal path, not an edge case: this project redeploys on push to
+`main`, so `./deploy.sh` runs on the platform's build host and never on your
+machine — and `outputs.json` is gitignored, so a fresh clone doesn't have it.
+
+```bash
+./scripts/validate.sh                     # is the plumbing working?
+./scripts/seed.sh you@example.com         # give the UI something to show
+./scripts/seed.sh you@example.com --clean # remove it again
+```
+
+`validate.sh` exercises the real browser path — CloudFront → Cognito sign-in →
+ID token → API Gateway authorizer → Lambda → DynamoDB — plus the CORS preflight,
+the unauthenticated 401, and owner scoping on `/audit`. It seeds one certificate,
+reads it back, and deletes it. Exits non-zero on the first failure.
+
+### An empty Certificates tab is the expected state, and is not a fault
+
+The most confusing property of this system: **discovery and the API disagree
+about what `OwnerId` means.**
+
+| | writes/reads `OwnerId` as |
+|---|---|
+| `discovery_acm` (ACM) | the certificate's `DomainName` |
+| `discovery_acm` (IAM) | the server certificate's `Path` |
+| `discovery_acm` (Secrets Manager) | the `crm:owner-id` tag |
+| `GET /certs`, `GET /ad-accounts` | the caller's Cognito `sub` (a UUID) |
+
+Both index the same GSI (`OwnerIndex`), so a completely healthy discovery run
+writes rows that belong to no human login and therefore appear in **nobody's**
+UI. Seeing "No certificates found" after a successful deploy tells you nothing
+about whether the pipeline works — which is exactly why `seed.sh` exists.
+
+`scripts/seed.sh` resolves a real Cognito `sub` via `admin-get-user` and writes
+rows owned by it: five certificates spanning all three bands the UI colours
+(`≤7d` red, `≤30d` amber, else green), three AD accounts, and three audit events.
+Every id starts with `seed-`, and `--clean` deletes only those ids, so it can
+never remove a genuinely discovered certificate.
+
+Two GSI details make seeding by hand error-prone, and are asserted in
+`test_seed_script.py`: `OwnerIndex` has a RANGE key on both tables (`ExpiryDate`
+for certs, `NextRotationDate` for AD accounts), and DynamoDB omits an item from
+an index entirely — silently, with no error on write — when it lacks that index's
+range key. A row missing it is accepted by `PutItem` and then never returned by
+`GET /certs`.
+
+Reconciling the two `OwnerId` meanings properly (a mapping from discovered
+resource to owning user, e.g. resolving the `crm:owner-id` tag to a Cognito sub)
+is a design decision left open — see *Deviations from `spec/`*.
+
 ## Testing
 
 `tests/` contains a pytest suite: one file per Lambda function (mocking
@@ -146,6 +199,68 @@ so a bad property or type fails here rather than as a `CREATE_FAILED` partway
 through a deploy. It complements rather than replaces the explicit checks in
 `test_template.py` — cfn-lint does not cover every service enum, and notably
 accepts an invalid Cognito `MfaConfiguration`.
+
+### Lambda layer packaging — the 502 on every API route
+
+Every API route returned `502 Bad Gateway` with body `{"message": "Internal
+server error"}`, and the UI showed a bare "Internal server error" banner with an
+empty table. The cause was one line of build metadata:
+
+```yaml
+  CommonLayer:
+    Properties:
+      ContentUri: layers/common/     # already contains python/crm_common/
+    Metadata:
+      BuildMethod: python3.13        # <- the bug
+```
+
+`BuildMethod: python3.x` on a `LayerVersion` routes it through SAM's Python
+builder, which **adds the `python/` prefix itself** — AWS's own layer example
+points `ContentUri` at a directory holding `requirements.txt`, not at one that
+already has a `python/` folder. So SAM built the artifact as
+`python/python/crm_common/__init__.py`, verified with `sam build`:
+
+```
+.aws-sam/build/CommonLayer/python/python/crm_common/__init__.py
+```
+
+Lambda extracts a layer to `/opt` and puts `/opt/python` on `sys.path`. That
+directory then contained `python/`, not `crm_common/`, so the
+`from crm_common import ...` at module scope in every function raised
+`ModuleNotFoundError` during init — before any handler code ran. API Gateway
+reports a proxy-integration Lambda that fails init as a bare 502, which is why
+nothing about a missing module was visible from the browser.
+
+Dropping `BuildMethod` makes SAM package `ContentUri` verbatim. The built
+template then carries `ContentUri: ../../layers/common`, resolving back to the
+source tree whose root is `python/` — the layout Lambda requires.
+`test_layer_packaging.py` asserts both halves: that the content root has a
+`python/` directory, and that `BuildMethod` is only ever declared alongside a
+`requirements.txt` manifest for it to build.
+
+### Unhandled exceptions must not become 502s
+
+The reason the above took so long to find is that a 502 is *information-free* in
+a browser: API Gateway generates it, so it carries none of the CORS headers the
+function would have set, and the real exception exists only in CloudWatch.
+
+`crm_common.guard_api_handler` now wraps the three browser-facing handlers
+(`api_certs`, `api_ad`, `api_audit`). It prints the traceback to stderr — so it
+still lands in CloudWatch — and returns a well-formed `500` with the CORS header
+intact and a generic `{"message": "internal error"}` body, so the UI can display
+something and the failure is never mistaken for a CORS problem again.
+
+The event-driven functions (`expiry_evaluator`, `jira_notifier`,
+`discovery_ad_trigger`, `renewal_executor`, `audit_exporter`) deliberately do
+**not** use the guard: they must keep raising, or Step Functions retries and
+SQS redrive-to-DLQ stop working. `test_error_handling.py` asserts both
+behaviours.
+
+A related 502 vector was closed at the same time: `GET /certs` and
+`GET /ad-accounts` query `OwnerIndex` on the caller's Cognito `sub`, and
+DynamoDB rejects an empty string as a key value with `ValidationException`. An
+absent `sub` therefore raised rather than returning an empty list. Both handlers
+now return `401` before making the call.
 
 ### YAML 1.1 boolean aliases
 
