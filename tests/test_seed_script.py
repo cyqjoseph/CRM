@@ -118,3 +118,29 @@ def test_validate_and_seed_share_the_output_resolver():
             f"scripts/{name} must source lib-stack-outputs.sh rather than "
             "reimplement output resolution"
         )
+
+
+def test_running_the_resolver_directly_reports_what_it_found():
+    """As a pure library it exited 0 in total silence, which reads as a no-op.
+
+    Executing it is the obvious way to check whether credentials and the stack
+    are reachable, so it has to say something when run rather than sourced.
+    """
+    assert "BASH_SOURCE" in LIB_CODE, (
+        "lib-stack-outputs.sh must distinguish being executed from being sourced"
+    )
+    assert "resolved from" in LIB, "executing the resolver must print what it resolved"
+
+
+def test_the_resolver_stays_quiet_when_sourced():
+    """The summary must not contaminate callers that parse or display output."""
+    guard = LIB_CODE.index("BASH_SOURCE")
+    printf_calls = [
+        i for i, line in enumerate(LIB_CODE.splitlines()) if "printf 'resolved from" in line
+    ]
+    assert printf_calls, "expected the summary to be printed with printf"
+    # Every summary line must sit after the executed-vs-sourced guard.
+    assert LIB_CODE.index("resolved from") > guard, (
+        "the summary must be inside the `executed directly` branch, or sourcing "
+        "the library would print it on every validate.sh/seed.sh run"
+    )

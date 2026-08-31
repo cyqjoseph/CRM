@@ -67,3 +67,18 @@ API_URL="${API_URL%/}"
 APP_URL="${APP_URL%/}"
 
 export API_URL APP_URL USER_POOL_ID USER_POOL_CLIENT_ID OUTPUTS_SOURCE
+
+# Running this file directly is the obvious way to check "are my credentials and
+# stack reachable?" — but as a pure library it answered that question with total
+# silence and exit 0, which is indistinguishable from doing nothing. Print what
+# was resolved when executed, stay quiet when sourced.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  printf 'resolved from %s\n\n' "$OUTPUTS_SOURCE"
+  printf '  API_URL              %s\n' "$API_URL"
+  printf '  APP_URL              %s\n' "$APP_URL"
+  printf '  USER_POOL_ID         %s\n' "$USER_POOL_ID"
+  printf '  USER_POOL_CLIENT_ID  %s\n' "$USER_POOL_CLIENT_ID"
+  printf '\nThis file is a library — source it, or run:\n'
+  printf '  ./scripts/validate.sh\n'
+  printf '  ./scripts/seed.sh <email>\n'
+fi
