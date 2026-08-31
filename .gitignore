@@ -1,0 +1,11 @@
+node_modules/
+.aws-sam/
+cdk.out/
+__pycache__/
+*.pyc
+.venv/
+dist/
+build/
+outputs.json
+*.log
+.DS_Store
