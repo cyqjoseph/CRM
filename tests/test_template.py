@@ -149,6 +149,7 @@ def test_resource_names_use_the_mandated_prefix():
         "Name",
         "AlarmName",
         "DashboardName",
+        "LogGroupName",
     )
     # SSM parameters live under a path, not a name prefix (see CLAUDE.md's
     # Configuration and secrets section); group names within a user pool

@@ -10,6 +10,13 @@ UI_BUCKET="app-d9fae51c-1929cc69-ui-site"
 ARCHIVE_BUCKET="app-d9fae51c-1929cc69-audit-archive"
 OUTPUTS_FILE="outputs.json"
 
+# Every AWS::SecretsManager::Secret name in template.yaml. Kept in sync by
+# tests/test_scripts.py::test_both_scripts_cover_every_secret_in_the_template.
+SECRET_NAMES=(
+  "app-d9fae51c-1929cc69-ad-bind-creds"
+  "app-d9fae51c-1929cc69-jira-token"
+)
+
 # --- Empty S3 buckets the stack owns; DeleteStack fails on non-empty buckets ---
 for BUCKET in "$UI_BUCKET" "$ARCHIVE_BUCKET"; do
   if aws s3api head-bucket --bucket "$BUCKET" --region "$REGION" 2>/dev/null; then
@@ -20,6 +27,22 @@ done
 # --- Delete the CloudFormation stack (owns everything except the ECR repo) ---
 aws cloudformation delete-stack --stack-name "$STACK_NAME" --region "$REGION"
 aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME" --region "$REGION"
+
+# --- Purge the secrets outright -----------------------------------------------
+# DeleteStack above only *scheduled* these for deletion, behind a 30-day recovery
+# window that keeps the names reserved. Leaving them in that state makes the next
+# ./deploy.sh fail at CREATE with "already scheduled for deletion", which — since
+# both secrets are in CloudFormation's first creation wave — cancels every table,
+# bucket, topic and queue beside them. Must run AFTER DeleteStack, or the stack
+# deletion simply re-schedules them.
+for SECRET in "${SECRET_NAMES[@]}"; do
+  if aws secretsmanager describe-secret --secret-id "$SECRET" --region "$REGION" >/dev/null 2>&1; then
+    # A secret already scheduled for deletion rejects --force-delete-without-recovery.
+    aws secretsmanager restore-secret --secret-id "$SECRET" --region "$REGION" >/dev/null 2>&1 || true
+    aws secretsmanager delete-secret --secret-id "$SECRET" --region "$REGION" \
+      --force-delete-without-recovery >/dev/null 2>&1 || true
+  fi
+done
 
 # --- Delete the ECR repository directly; CloudFormation never owned it ---
 aws ecr delete-repository --repository-name "$ECR_REPO" --region "$REGION" --force 2>/dev/null || true

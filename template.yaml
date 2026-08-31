@@ -413,7 +413,9 @@ Resources:
   AdTaskLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: /ecs/app-d9fae51c-1929cc69-ad-agent
+      # Must start with the mandated prefix, so no leading /ecs/ path segment:
+      # the deploy role's logs:CreateLogGroup grant is scoped by name.
+      LogGroupName: app-d9fae51c-1929cc69-ad-agent
       RetentionInDays: 30
 
   AdTaskExecutionRole:

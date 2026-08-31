@@ -11,12 +11,65 @@ ECR_REPO="app-d9fae51c-1929cc69-ad-agent"
 AD_AGENT_DIR="ad-agent"
 OUTPUTS_FILE="outputs.json"
 
+# Every AWS::SecretsManager::Secret name in template.yaml. Kept in sync by
+# tests/test_scripts.py::test_both_scripts_cover_every_secret_in_the_template.
+SECRET_NAMES=(
+  "app-d9fae51c-1929cc69-ad-bind-creds"
+  "app-d9fae51c-1929cc69-jira-token"
+)
+
 if [ ! -f "$TEMPLATE_FILE" ]; then
   echo "error: $TEMPLATE_FILE not found at repo root — nothing to deploy" >&2
   exit 1
 fi
 
+# --- Report the ROOT cause when a deploy fails ---------------------------------
+# A rollback stamps "Resource creation cancelled" on every resource that was
+# merely queued behind the one that actually failed. `sam deploy` surfaces that
+# cascade and not the reason, so a failed deploy looks unattributable. Print the
+# real failures — those with a reason other than the cancellation boilerplate.
+dump_stack_failures() {
+  echo "" >&2
+  echo "=== root CloudFormation failures for $STACK_NAME (oldest first) ===" >&2
+  aws cloudformation describe-stack-events \
+      --stack-name "$STACK_NAME" --region "$REGION" \
+      --query "reverse(StackEvents[?contains(ResourceStatus, 'FAILED') && ResourceStatusReason != 'Resource creation cancelled'].[Timestamp, LogicalResourceId, ResourceType, ResourceStatusReason])" \
+      --output table >&2 \
+    || echo "(could not read stack events for $STACK_NAME)" >&2
+  echo "=== end of root failures ===" >&2
+}
+
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+
+# --- Preflight: purge secrets left "scheduled for deletion" -------------------
+# CloudFormation's DeleteStack does NOT purge a Secrets Manager secret; it only
+# schedules deletion behind a recovery window (30 days by default), and the name
+# stays reserved for that whole window. Re-creating the same name then fails at
+# once with "already scheduled for deletion". Both secrets are dependency-free,
+# so they sit in CloudFormation's FIRST creation wave alongside the DynamoDB
+# tables, S3 buckets, SNS topics and SQS queues — one failing there cancels all
+# of them, which is why such a rollback shows nothing but cancellations.
+# restore-secret first: delete-secret --force-delete-without-recovery is
+# rejected on a secret that is already scheduled for deletion.
+for SECRET in "${SECRET_NAMES[@]}"; do
+  DELETED_DATE="$(aws secretsmanager describe-secret \
+    --secret-id "$SECRET" --region "$REGION" \
+    --query 'DeletedDate' --output text 2>/dev/null || echo ABSENT)"
+
+  if [ "$DELETED_DATE" != "ABSENT" ] && [ "$DELETED_DATE" != "None" ]; then
+    echo "preflight: $SECRET is scheduled for deletion ($DELETED_DATE) — purging so it can be re-created"
+    aws secretsmanager restore-secret --secret-id "$SECRET" --region "$REGION" >/dev/null
+    aws secretsmanager delete-secret --secret-id "$SECRET" --region "$REGION" \
+      --force-delete-without-recovery >/dev/null
+
+    # The name is not reusable until the purge lands; poll rather than guess.
+    for _ in $(seq 1 30); do
+      aws secretsmanager describe-secret --secret-id "$SECRET" --region "$REGION" \
+        >/dev/null 2>&1 || break
+      sleep 2
+    done
+  fi
+done
 
 # --- Artifacts bucket for `sam deploy` (never use --resolve-s3/--guided; see CLAUDE.md) ---
 if ! aws s3api head-bucket --bucket "$ARTIFACTS_BUCKET" --region "$REGION" 2>/dev/null; then
@@ -62,7 +115,7 @@ if [ "${#DEPLOY_PARAM_OVERRIDES[@]}" -gt 0 ]; then
   DEPLOY_ARGS+=(--parameter-overrides "${DEPLOY_PARAM_OVERRIDES[@]}")
 fi
 
-sam deploy "${DEPLOY_ARGS[@]}"
+sam deploy "${DEPLOY_ARGS[@]}" || { dump_stack_failures; exit 1; }
 
 # --- Fetch the stack's CloudFormation outputs (reused below) ---
 aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \

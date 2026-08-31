@@ -1,2 +1,5 @@
 pytest>=9.1
 PyYAML>=6.0
+# The function modules under test import boto3 at module scope, so the suite
+# fails at collection without it.
+boto3>=1.35
