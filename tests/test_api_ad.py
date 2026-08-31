@@ -36,3 +36,17 @@ def test_rotate_returns_202_with_execution_arn(mock_client, mock_resource):
     body = json.loads(response["body"])
     assert "executionArn" in body
     assert body["executionArn"] == "arn:aws:states:rotation:exec-1"
+
+
+@patch("boto3.resource")
+@patch("boto3.client")
+def test_list_without_a_sub_claim_is_401_not_a_dynamodb_error(mock_client, mock_resource):
+    """Same empty-partition-key trap as GET /certs — see test_api_certs.py."""
+    table = MagicMock()
+    mock_resource.return_value.Table.return_value = table
+
+    # Truthy, so _event does not substitute its default — but no `sub`.
+    response = app.handler(_event("GET", claims={"email": "nobody@example.com"}), None)
+
+    assert response["statusCode"] == 401
+    table.query.assert_not_called()

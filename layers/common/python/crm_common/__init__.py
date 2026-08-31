@@ -1,8 +1,11 @@
 """Shared helpers for Centralised Resource Manager Lambda functions."""
+import functools
 import hashlib
 import json
 import os
+import sys
 import time
+import traceback
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -67,6 +70,40 @@ def api_response(status_code, body):
         },
         "body": json.dumps(body, cls=DecimalEncoder),
     }
+
+
+def guard_api_handler(handler):
+    """Turn an unhandled exception in a browser-facing handler into a 500.
+
+    API Gateway answers a raising proxy-integration Lambda with a bare 502 that
+    carries none of the headers the function would have set — so the browser
+    reports a CORS failure, the UI shows "Failed to fetch", and the real reason
+    exists only in CloudWatch. A well-formed 500 keeps the CORS header and gives
+    the UI something to display, while the traceback still reaches the log.
+
+    Only for the three API handlers. The event-driven functions must keep
+    raising, or Step Functions retries and SQS redrive-to-DLQ stop working.
+    """
+
+    @functools.wraps(handler)
+    def wrapper(event, context):
+        try:
+            return handler(event, context)
+        except Exception:
+            print(
+                "unhandled error in %s %s: %s"
+                % (
+                    (event or {}).get("httpMethod", "?"),
+                    (event or {}).get("resource", "?"),
+                    traceback.format_exc(),
+                ),
+                file=sys.stderr,
+            )
+            # Deliberately generic: the traceback belongs in CloudWatch, not in
+            # a response the browser can read.
+            return api_response(500, {"message": "internal error"})
+
+    return wrapper
 
 
 def get_claims(event):

@@ -40,6 +40,25 @@ def test_renew_returns_202_with_execution_arn(mock_client, mock_resource):
 
 @patch("boto3.resource")
 @patch("boto3.client")
+def test_list_without_a_sub_claim_is_401_not_a_dynamodb_error(mock_client, mock_resource):
+    """An empty partition-key value is a ValidationException, i.e. another 502.
+
+    DynamoDB rejects an empty string for a key attribute, so querying OwnerIndex
+    with an absent `sub` raises instead of returning an empty list. Reject it
+    before the call so the caller gets a readable 401.
+    """
+    table = MagicMock()
+    mock_resource.return_value.Table.return_value = table
+
+    # Truthy, so _event does not substitute its default — but no `sub`.
+    response = app.handler(_event("GET", claims={"email": "nobody@example.com"}), None)
+
+    assert response["statusCode"] == 401
+    table.query.assert_not_called()
+
+
+@patch("boto3.resource")
+@patch("boto3.client")
 def test_renew_of_other_owners_cert_is_not_found(mock_client, mock_resource):
     table = MagicMock()
     table.get_item.return_value = {"Item": {"CertId": "cert-1", "OwnerId": "someone-else"}}

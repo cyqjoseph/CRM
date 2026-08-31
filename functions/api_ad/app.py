@@ -2,7 +2,15 @@
 import os
 
 import boto3
-from crm_common import api_response, get_claims, is_admin, new_request_id, owner_id_of, put_audit_event
+from crm_common import (
+    api_response,
+    get_claims,
+    guard_api_handler,
+    is_admin,
+    new_request_id,
+    owner_id_of,
+    put_audit_event,
+)
 
 AD_TABLE_NAME = os.environ["AD_TABLE_NAME"]
 ROTATION_STATE_MACHINE_ARN = os.environ["ROTATION_STATE_MACHINE_ARN"]
@@ -14,6 +22,11 @@ def _list_accounts(table, claims, query_params):
         owner_id = query_params["ownerId"]
     else:
         owner_id = owner_id_of(claims)
+
+    if not owner_id:
+        # An empty string is not a valid DynamoDB key value; without this the
+        # query raises ValidationException and API Gateway reports a 502.
+        return api_response(401, {"message": "unauthenticated"})
 
     response = table.query(
         IndexName="OwnerIndex",
@@ -63,6 +76,7 @@ def _rotate_account(table, claims, account_id):
     return api_response(202, {"executionArn": execution["executionArn"], "requestId": request_id})
 
 
+@guard_api_handler
 def handler(event, context):
     claims = get_claims(event)
     table = boto3.resource("dynamodb").Table(AD_TABLE_NAME)

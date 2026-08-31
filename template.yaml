@@ -45,11 +45,19 @@ Resources:
     Type: AWS::Serverless::LayerVersion
     Properties:
       LayerName: app-d9fae51c-1929cc69-common-layer
+      # Packaged verbatim, so the zip root keeps the python/ prefix that Lambda
+      # requires to make crm_common importable.
+      #
+      # Deliberately NO `Metadata: BuildMethod: python3.13`. That routes the layer
+      # through SAM's pip builder, which expects a requirements.txt manifest at
+      # this ContentUri — there isn't one, because this layer is pure first-party
+      # source with no third-party dependencies. Without the manifest the builder's
+      # output is version-dependent, and if python/ is lost from the artifact root
+      # every function fails init on `from crm_common import ...`, which API
+      # Gateway reports only as 502 Bad Gateway.
       ContentUri: layers/common/
       CompatibleRuntimes:
         - python3.13
-    Metadata:
-      BuildMethod: python3.13
 
   # ---------------------------------------------------------------------------
   # DynamoDB inventory + audit tables

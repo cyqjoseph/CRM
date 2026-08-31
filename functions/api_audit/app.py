@@ -6,7 +6,7 @@ caller to be in the Cognito admin group.
 import os
 
 import boto3
-from crm_common import api_response, get_claims, is_admin, owner_id_of
+from crm_common import api_response, get_claims, guard_api_handler, is_admin, owner_id_of
 
 AUDIT_TABLE_NAME = os.environ["AUDIT_TABLE_NAME"]
 
@@ -51,6 +51,7 @@ def _get_execution(claims, execution_id):
     )
 
 
+@guard_api_handler
 def handler(event, context):
     claims = get_claims(event)
     resource_path = event.get("resource", "")
