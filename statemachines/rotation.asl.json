@@ -1,35 +1,12 @@
 {
-  "Comment": "AD account credential rotation workflow via Fargate task",
-  "StartAt": "RunAdRotationTask",
+  "Comment": "IAM access key rotation workflow — flags the account only, never mutates the live key (see rotation-iam-key-fn)",
+  "StartAt": "RunIamKeyRotation",
   "States": {
-    "RunAdRotationTask": {
+    "RunIamKeyRotation": {
       "Type": "Task",
-      "Resource": "arn:aws:states:::ecs:runTask.sync",
-      "Parameters": {
-        "Cluster": "${EcsClusterArn}",
-        "TaskDefinition": "${AdTaskDefinitionArn}",
-        "LaunchType": "FARGATE",
-        "NetworkConfiguration": {
-          "AwsvpcConfiguration": {
-            "Subnets": ${SubnetIdsJson},
-            "SecurityGroups": ["${AdTaskSecurityGroupId}"],
-            "AssignPublicIp": "ENABLED"
-          }
-        },
-        "Overrides": {
-          "ContainerOverrides": [
-            {
-              "Name": "ad-agent",
-              "Environment": [
-                { "Name": "AD_TASK_MODE", "Value": "ROTATE" },
-                { "Name": "ROTATION_ACCOUNT_HASH.$", "Value.$": "$.accountIdHash" }
-              ]
-            }
-          ]
-        }
-      },
+      "Resource": "${RotationIamKeyFunctionArn}",
       "ResultPath": "$.rotationTask",
-      "Next": "UpdateAdInventory",
+      "Next": "UpdateIamAccount",
       "Catch": [
         {
           "ErrorEquals": ["States.ALL"],
@@ -38,17 +15,20 @@
         }
       ]
     },
-    "UpdateAdInventory": {
+    "UpdateIamAccount": {
       "Type": "Task",
       "Resource": "arn:aws:states:::dynamodb:updateItem",
       "Parameters": {
-        "TableName": "${AdTableName}",
+        "TableName": "${IamTableName}",
         "Key": {
           "AccountIdHash": { "S.$": "$.accountIdHash" }
         },
-        "UpdateExpression": "SET RotationStatus = :status",
+        "UpdateExpression": "SET #s = :status",
+        "ExpressionAttributeNames": {
+          "#s": "Status"
+        },
         "ExpressionAttributeValues": {
-          ":status": { "S": "ACTIVE" }
+          ":status": { "S": "active" }
         }
       },
       "ResultPath": "$.inventoryUpdate",
@@ -74,7 +54,7 @@
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn": "${CompletionsTopicArn}",
-        "Subject": "AD account rotation complete",
+        "Subject": "IAM key rotation flagged",
         "Message.$": "States.Format('accountIdHash={} status=SUCCESS', $.accountIdHash)"
       },
       "End": true

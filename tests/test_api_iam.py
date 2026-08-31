@@ -3,10 +3,10 @@ from unittest.mock import MagicMock, patch
 
 from conftest import load_module
 
-app = load_module("api_ad_app", "functions/api_ad/app.py")
+app = load_module("api_iam_app", "functions/api_iam/app.py")
 
 
-def _event(method, account_id=None, resource="/ad-accounts", claims=None):
+def _event(method, account_id=None, resource="/iam/accounts", claims=None):
     path_params = {"accountId": account_id} if account_id else None
     return {
         "httpMethod": method,
@@ -29,7 +29,7 @@ def test_rotate_returns_202_with_execution_arn(mock_client, mock_resource):
     mock_client.return_value = sfn
 
     response = app.handler(
-        _event("POST", account_id="hash-1", resource="/ad-accounts/{accountId}/rotate"), None
+        _event("POST", account_id="hash-1", resource="/iam/accounts/{accountId}/rotate"), None
     )
 
     assert response["statusCode"] == 202
@@ -50,3 +50,23 @@ def test_list_without_a_sub_claim_is_401_not_a_dynamodb_error(mock_client, mock_
 
     assert response["statusCode"] == 401
     table.query.assert_not_called()
+
+
+@patch("boto3.resource")
+@patch("boto3.client")
+def test_list_filters_by_status_query_param(mock_client, mock_resource):
+    table = MagicMock()
+    table.query.return_value = {
+        "Items": [
+            {"AccountIdHash": "hash-1", "OwnerId": "owner-1", "Status": "warning"},
+            {"AccountIdHash": "hash-2", "OwnerId": "owner-1", "Status": "active"},
+        ]
+    }
+    mock_resource.return_value.Table.return_value = table
+
+    event = _event("GET")
+    event["queryStringParameters"] = {"status": "warning"}
+    response = app.handler(event, None)
+
+    body = json.loads(response["body"])
+    assert [item["AccountIdHash"] for item in body["items"]] == ["hash-1"]

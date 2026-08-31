@@ -1,0 +1,8 @@
+# STUB — non-functional. See ansible/README.md.
+---
+- name: Discover on-prem AD accounts
+  hosts: domain_controllers
+  gather_facts: false
+  roles:
+    - discover-ad-accounts
+    - report-to-dynamodb

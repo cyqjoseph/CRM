@@ -5,7 +5,6 @@ set -euo pipefail
 
 REGION="ap-southeast-1"
 STACK_NAME="app-d9fae51c-1929cc69-crm"
-ECR_REPO="app-d9fae51c-1929cc69-ad-agent"
 UI_BUCKET="app-d9fae51c-1929cc69-ui-site"
 ARCHIVE_BUCKET="app-d9fae51c-1929cc69-audit-archive"
 OUTPUTS_FILE="outputs.json"
@@ -13,7 +12,7 @@ OUTPUTS_FILE="outputs.json"
 # Every AWS::SecretsManager::Secret name in template.yaml. Kept in sync by
 # tests/test_scripts.py::test_both_scripts_cover_every_secret_in_the_template.
 SECRET_NAMES=(
-  "app-d9fae51c-1929cc69-ad-bind-creds"
+  "app-d9fae51c-1929cc69-test-instance-registry"
   "app-d9fae51c-1929cc69-jira-token"
 )
 
@@ -32,9 +31,9 @@ aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME" --regio
 # DeleteStack above only *scheduled* these for deletion, behind a 30-day recovery
 # window that keeps the names reserved. Leaving them in that state makes the next
 # ./deploy.sh fail at CREATE with "already scheduled for deletion", which — since
-# both secrets are in CloudFormation's first creation wave — cancels every table,
-# bucket, topic and queue beside them. Must run AFTER DeleteStack, or the stack
-# deletion simply re-schedules them.
+# JiraTokenSecret is in CloudFormation's first creation wave — cancels every
+# table, bucket, topic and queue beside it. Must run AFTER DeleteStack, or the
+# stack deletion simply re-schedules them.
 for SECRET in "${SECRET_NAMES[@]}"; do
   if aws secretsmanager describe-secret --secret-id "$SECRET" --region "$REGION" >/dev/null 2>&1; then
     # A secret already scheduled for deletion rejects --force-delete-without-recovery.
@@ -43,9 +42,6 @@ for SECRET in "${SECRET_NAMES[@]}"; do
       --force-delete-without-recovery >/dev/null 2>&1 || true
   fi
 done
-
-# --- Delete the ECR repository directly; CloudFormation never owned it ---
-aws ecr delete-repository --repository-name "$ECR_REPO" --region "$REGION" --force 2>/dev/null || true
 
 rm -f "$OUTPUTS_FILE"
 

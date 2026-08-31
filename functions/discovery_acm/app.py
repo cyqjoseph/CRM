@@ -5,6 +5,7 @@ plaintext certificate or private key material (Requirement 1.4).
 """
 import os
 import time
+from datetime import datetime, timezone
 
 import boto3
 
@@ -24,6 +25,8 @@ ALLOWED_FIELDS = {
     "Status",
     "Source",
     "Version",
+    "EnvironmentTag",
+    "LastSyncedAt",
 }
 
 
@@ -47,6 +50,7 @@ def _discover_acm_certs(acm_client):
                     "ExpiryDate": cert.get("NotAfter").isoformat() if cert.get("NotAfter") else None,
                     "Status": cert.get("Status", "UNKNOWN"),
                     "Source": "acm",
+                    "EnvironmentTag": "aws",
                 }
             )
     return items
@@ -65,6 +69,7 @@ def _discover_iam_server_certs(iam_client):
                     "ExpiryDate": meta.get("Expiration").isoformat() if meta.get("Expiration") else None,
                     "Status": "ISSUED",
                     "Source": "iam",
+                    "EnvironmentTag": "aws",
                 }
             )
     return items
@@ -89,6 +94,7 @@ def _discover_secrets_manager_certs(secretsmanager_client):
                     "ExpiryDate": tags.get("crm:expiry-date"),
                     "Status": "ISSUED",
                     "Source": "secretsmanager",
+                    "EnvironmentTag": "aws",
                 }
             )
     return items
@@ -110,6 +116,7 @@ def handler(event, context):
     for raw_item in discovered:
         item = _sanitize(raw_item)
         item["Version"] = int(time.time())
+        item["LastSyncedAt"] = datetime.now(timezone.utc).isoformat()
         table.put_item(Item=item)
         written += 1
 

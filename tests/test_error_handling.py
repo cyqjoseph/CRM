@@ -6,10 +6,11 @@ browser reports a CORS failure, the UI shows "Failed to fetch", and the actual
 reason exists only in CloudWatch — the same invisibility problem as a rollback
 that reports nothing but "Resource creation cancelled".
 
-The three API handlers therefore catch, log and return a well-formed 500.
+These API Gateway-fronted handlers therefore catch, log and return a
+well-formed 500.
 
 The event-driven functions deliberately do NOT do this: expiry_evaluator,
-jira_notifier and discovery_ad_trigger must keep raising so Step Functions
+jira_notifier and discovery_iam must keep raising so Step Functions
 retries and SQS redrive-to-DLQ still work.
 """
 import json
@@ -20,14 +21,16 @@ from conftest import load_module
 
 API_MODULES = {
     "certs": ("api_certs_err", "functions/api_certs/app.py"),
-    "ad": ("api_ad_err", "functions/api_ad/app.py"),
+    "iam": ("api_iam_err", "functions/api_iam/app.py"),
     "audit": ("api_audit_err", "functions/api_audit/app.py"),
+    "sync": ("sync_on_prem_err", "functions/sync_on_prem/app.py"),
 }
 
 EVENTS = {
     "certs": {"httpMethod": "GET", "resource": "/certs"},
-    "ad": {"httpMethod": "GET", "resource": "/ad-accounts"},
+    "iam": {"httpMethod": "GET", "resource": "/iam/accounts"},
     "audit": {"httpMethod": "GET", "resource": "/audit"},
+    "sync": {"httpMethod": "POST", "resource": "/sync/on-prem-data"},
 }
 
 
@@ -36,6 +39,8 @@ def _event(name):
     event["pathParameters"] = None
     event["queryStringParameters"] = {"entityId": "owner-1"} if name == "audit" else None
     event["requestContext"] = {"authorizer": {"claims": {"sub": "owner-1"}}}
+    if name == "sync":
+        event["body"] = json.dumps({"table": "certificates", "item": {"CertId": "x"}})
     return event
 
 
@@ -50,6 +55,7 @@ def test_api_handler_returns_500_instead_of_raising(mock_client, mock_resource, 
     table.query.side_effect = boom
     table.get_item.side_effect = boom
     table.scan.side_effect = boom
+    table.put_item.side_effect = boom
     mock_resource.return_value.Table.return_value = table
     mock_client.side_effect = boom
 
@@ -79,6 +85,7 @@ def test_api_handler_logs_the_traceback(mock_client, mock_resource, name, capsys
     table.query.side_effect = boom
     table.get_item.side_effect = boom
     table.scan.side_effect = boom
+    table.put_item.side_effect = boom
     mock_resource.return_value.Table.return_value = table
     mock_client.side_effect = boom
 

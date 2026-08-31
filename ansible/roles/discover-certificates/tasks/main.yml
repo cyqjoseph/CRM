@@ -1,0 +1,17 @@
+# STUB — non-functional. See ansible/README.md.
+#
+# Intent: enumerate certificates issued by the on-prem ADCS certificate
+# authority and their expiry dates. Mirrors functions/discovery_acm/app.py's
+# AWS-side equivalent.
+---
+- name: TODO — query the ADCS CA for issued certificates (e.g. certutil, or community.crypto)
+  debug:
+    msg: "STUB: not implemented — see ansible/README.md"
+
+- name: TODO — compute days-to-expiry per certificate
+  debug:
+    msg: "STUB: not implemented"
+
+- name: TODO — hand discovered certificates to report-to-dynamodb
+  debug:
+    msg: "STUB: not implemented"

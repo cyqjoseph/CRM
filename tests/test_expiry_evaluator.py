@@ -13,18 +13,18 @@ def _soon(days):
     return (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
 
 
-def _mock_dynamo(cert_items, ad_items):
+def _mock_dynamo(cert_items, iam_items):
     dynamodb = MagicMock()
     cert_table = MagicMock()
-    ad_table = MagicMock()
+    iam_table = MagicMock()
     audit_table = MagicMock()
     cert_table.query.return_value = {"Items": cert_items}
-    ad_table.query.return_value = {"Items": ad_items}
+    iam_table.query.return_value = {"Items": iam_items}
 
     def table_side_effect(name):
         return {
             app.CERT_TABLE_NAME: cert_table,
-            app.AD_TABLE_NAME: ad_table,
+            app.IAM_TABLE_NAME: iam_table,
             os.environ["AUDIT_TABLE_NAME"]: audit_table,
         }[name]
 

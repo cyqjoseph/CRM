@@ -1,0 +1,8 @@
+# STUB — non-functional. See ansible/README.md.
+#
+# Intent: the top-level playbook a scheduler (cron, AWX/Ansible Tower) would
+# run periodically to discover on-prem AD accounts and ADCS certificates and
+# push both into the unified dashboard via report-to-dynamodb.
+---
+- import_playbook: discover-ad-accounts.yml
+- import_playbook: discover-certificates.yml

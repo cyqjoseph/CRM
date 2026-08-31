@@ -1,5 +1,5 @@
 {
-  "Comment": "Scheduled discovery: ACM/Secrets Manager/IAM cert scan + Fargate AD discovery",
+  "Comment": "Scheduled discovery: ACM/Secrets Manager/IAM cert scan + AWS IAM account scan",
   "StartAt": "Discover",
   "States": {
     "Discover": {
@@ -25,11 +25,11 @@
           }
         },
         {
-          "StartAt": "DiscoverAd",
+          "StartAt": "DiscoverIam",
           "States": {
-            "DiscoverAd": {
+            "DiscoverIam": {
               "Type": "Task",
-              "Resource": "${DiscoveryAdTriggerFunctionArn}",
+              "Resource": "${DiscoveryIamFunctionArn}",
               "Retry": [
                 {
                   "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],

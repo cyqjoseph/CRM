@@ -1,0 +1,21 @@
+# STUB — non-functional. See ansible/README.md.
+#
+# Intent: reset the password on an AD account flagged by
+# discover-ad-accounts. This is a high-blast-radius, hard-to-reverse action
+# (a service still using the old password breaks immediately) — the AWS-side
+# equivalent (functions/rotation_iam_key/app.py) deliberately only flags and
+# notifies rather than mutating anything. A real implementation of this role
+# should keep that same NOTIFY_ONLY-by-default posture and require an
+# explicit human confirmation step before actually resetting a password.
+---
+- name: TODO — require explicit confirmation before mutating any credential
+  debug:
+    msg: "STUB: not implemented — see ansible/README.md"
+
+- name: TODO — reset the flagged account's password (e.g. community.windows.win_domain_user)
+  debug:
+    msg: "STUB: not implemented"
+
+- name: TODO — report the rotation outcome via report-to-dynamodb
+  debug:
+    msg: "STUB: not implemented"

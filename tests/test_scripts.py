@@ -6,11 +6,11 @@ resource reported only "Resource creation cancelled":
 CloudFormation's DeleteStack does not purge an AWS::SecretsManager::Secret — it
 only schedules it for deletion behind a recovery window (30 days by default).
 The secret name stays reserved for that whole window, so the next deploy's
-CREATE of the same name fails immediately. Both secrets in template.yaml are
-dependency-free, which puts them in CloudFormation's first creation wave next to
-the tables, buckets, topics and queues; when one fails there, every sibling in
-that wave is stamped "Resource creation cancelled" and the real reason never
-appears against a resource anyone would look at.
+CREATE of the same name fails immediately. JiraTokenSecret is dependency-free,
+which puts it in CloudFormation's first creation wave next to the tables,
+buckets, topics and queues; when it fails there, every sibling in that wave is
+stamped "Resource creation cancelled" and the real reason never appears
+against a resource anyone would look at.
 
 So: deploy.sh must reconcile that state before deploying, destroy.sh must not
 leave it behind, and a failed deploy must print the root failure reasons rather
@@ -32,7 +32,7 @@ def _without_comments(script: str) -> str:
 
 # The two AWS::SecretsManager::Secret names in template.yaml.
 SECRET_NAMES = (
-    "app-d9fae51c-1929cc69-ad-bind-creds",
+    "app-d9fae51c-1929cc69-test-instance-registry",
     "app-d9fae51c-1929cc69-jira-token",
 )
 

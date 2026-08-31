@@ -7,14 +7,12 @@ REGION="ap-southeast-1"
 STACK_NAME="app-d9fae51c-1929cc69-crm"
 ARTIFACTS_BUCKET="app-d9fae51c-1929cc69-artifacts"
 TEMPLATE_FILE="template.yaml"
-ECR_REPO="app-d9fae51c-1929cc69-ad-agent"
-AD_AGENT_DIR="ad-agent"
 OUTPUTS_FILE="outputs.json"
 
 # Every AWS::SecretsManager::Secret name in template.yaml. Kept in sync by
 # tests/test_scripts.py::test_both_scripts_cover_every_secret_in_the_template.
 SECRET_NAMES=(
-  "app-d9fae51c-1929cc69-ad-bind-creds"
+  "app-d9fae51c-1929cc69-test-instance-registry"
   "app-d9fae51c-1929cc69-jira-token"
 )
 
@@ -39,14 +37,12 @@ dump_stack_failures() {
   echo "=== end of root failures ===" >&2
 }
 
-ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-
 # --- Preflight: purge secrets left "scheduled for deletion" -------------------
 # CloudFormation's DeleteStack does NOT purge a Secrets Manager secret; it only
 # schedules deletion behind a recovery window (30 days by default), and the name
 # stays reserved for that whole window. Re-creating the same name then fails at
-# once with "already scheduled for deletion". Both secrets are dependency-free,
-# so they sit in CloudFormation's FIRST creation wave alongside the DynamoDB
+# once with "already scheduled for deletion". JiraTokenSecret is dependency-free,
+# so it sits in CloudFormation's FIRST creation wave alongside the DynamoDB
 # tables, S3 buckets, SNS topics and SQS queues — one failing there cancels all
 # of them, which is why such a rollback shows nothing but cancellations.
 # restore-secret first: delete-secret --force-delete-without-recovery is
@@ -81,24 +77,6 @@ if ! aws s3api head-bucket --bucket "$ARTIFACTS_BUCKET" --region "$REGION" 2>/de
   fi
 fi
 
-DEPLOY_PARAM_OVERRIDES=()
-
-# --- AD discovery/rotation Fargate agent image (ECR repo is NOT owned by the stack) ---
-if [ -d "$AD_AGENT_DIR" ]; then
-  ECR_URI="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO}"
-
-  aws ecr describe-repositories --repository-names "$ECR_REPO" --region "$REGION" >/dev/null 2>&1 \
-    || aws ecr create-repository --repository-name "$ECR_REPO" --region "$REGION" >/dev/null
-
-  aws ecr get-login-password --region "$REGION" \
-    | docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com"
-
-  docker build -t "${ECR_URI}:latest" "$AD_AGENT_DIR"
-  docker push "${ECR_URI}:latest"
-
-  DEPLOY_PARAM_OVERRIDES+=("AdAgentImageUri=${ECR_URI}:latest")
-fi
-
 # --- Build and deploy the SAM stack ---
 sam build --template-file "$TEMPLATE_FILE"
 
@@ -111,15 +89,41 @@ DEPLOY_ARGS=(
   --no-confirm-changeset
 )
 
-if [ "${#DEPLOY_PARAM_OVERRIDES[@]}" -gt 0 ]; then
-  DEPLOY_ARGS+=(--parameter-overrides "${DEPLOY_PARAM_OVERRIDES[@]}")
-fi
-
 sam deploy "${DEPLOY_ARGS[@]}" || { dump_stack_failures; exit 1; }
 
 # --- Fetch the stack's CloudFormation outputs (reused below) ---
 aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
   --query "Stacks[0].Outputs" --output json > /tmp/"${STACK_NAME}"-outputs.json
+
+# --- Seed simulated ACM certificates correlated to the 3 EC2 test instances ---
+# A real ACM certificate cannot be issued for an invented hostname like
+# "crm-test-1.internal.example.com" — public issuance requires DNS/email
+# domain-ownership validation, which this project has no real zone for. These
+# rows simulate that inventory directly, correlated by instance id, so the UI's
+# certificate dashboard has real EC2-backed data to show end to end.
+CERT_TABLE="$(jq -r '.[] | select(.OutputKey=="CertInventoryTableName") | .OutputValue' /tmp/"${STACK_NAME}"-outputs.json)"
+for i in 1 2 3; do
+  INSTANCE_ID="$(jq -r ".[] | select(.OutputKey==\"TestInstance${i}Id\") | .OutputValue" /tmp/"${STACK_NAME}"-outputs.json)"
+  DOMAIN="crm-test-${i}.internal.example.com"
+  NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  EXPIRY_ISO="$(date -u -d "+90 days" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+90d +%Y-%m-%dT%H:%M:%SZ)"
+
+  aws dynamodb put-item \
+    --table-name "$CERT_TABLE" --region "$REGION" \
+    --item "{
+      \"CertId\": {\"S\": \"sim-cert-crm-test-${i}\"},
+      \"CertType\": {\"S\": \"SIMULATED_ACM\"},
+      \"OwnerId\": {\"S\": \"${DOMAIN}\"},
+      \"Domain\": {\"S\": \"${DOMAIN}\"},
+      \"ExpiryDate\": {\"S\": \"${EXPIRY_ISO}\"},
+      \"Status\": {\"S\": \"ISSUED\"},
+      \"Source\": {\"S\": \"AWS_ACM\"},
+      \"EnvironmentTag\": {\"S\": \"aws\"},
+      \"LastSyncedAt\": {\"S\": \"${NOW_ISO}\"},
+      \"InstanceId\": {\"S\": \"${INSTANCE_ID}\"},
+      \"Version\": {\"N\": \"1\"}
+    }"
+done
 
 # --- Sync the static self-service UI to S3 and invalidate the CloudFront cache ---
 if [ -d "ui" ]; then

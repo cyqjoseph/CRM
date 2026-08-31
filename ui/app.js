@@ -131,11 +131,11 @@
     btn.addEventListener("click", () => {
       document.querySelectorAll(".tab").forEach((b) => b.classList.remove("active"));
       btn.classList.add("active");
-      ["certs", "ad", "audit"].forEach((t) => {
+      ["certs", "iam", "audit"].forEach((t) => {
         el(`tab-${t}`).classList.toggle("hidden", t !== btn.dataset.tab);
       });
       if (btn.dataset.tab === "certs") loadCerts();
-      if (btn.dataset.tab === "ad") loadAdAccounts();
+      if (btn.dataset.tab === "iam") loadIamAccounts();
     });
   });
 
@@ -183,38 +183,39 @@
     }
   }
 
-  // --- AD accounts ---
+  // --- IAM accounts ---
 
-  async function loadAdAccounts() {
-    setError("adError", null);
+  async function loadIamAccounts() {
+    setError("iamError", null);
     try {
-      const data = await apiFetch("/ad-accounts", { method: "GET" });
+      const data = await apiFetch("/iam/accounts", { method: "GET" });
       const rows = (data.items || [])
         .map(
           (a) => `<tr>
+            <td>${a.UserName || ""}</td>
             <td>${a.AccountIdHash}</td>
             <td>${a.NextRotationDate || ""}</td>
-            <td>${a.RotationStatus || ""}</td>
+            <td>${a.Status || ""}</td>
             <td><button class="action" data-account="${a.AccountIdHash}">Rotate</button></td>
           </tr>`
         )
         .join("");
-      el("adBody").innerHTML = rows || `<tr><td colspan="4">No AD accounts found.</td></tr>`;
-      el("adBody").querySelectorAll("button[data-account]").forEach((b) => {
+      el("iamBody").innerHTML = rows || `<tr><td colspan="5">No IAM accounts found.</td></tr>`;
+      el("iamBody").querySelectorAll("button[data-account]").forEach((b) => {
         b.addEventListener("click", () => rotateAccount(b.dataset.account, b));
       });
     } catch (err) {
-      setError("adError", err.message);
+      setError("iamError", err.message);
     }
   }
 
   async function rotateAccount(accountId, button) {
     button.disabled = true;
     try {
-      await apiFetch(`/ad-accounts/${encodeURIComponent(accountId)}/rotate`, { method: "POST" });
+      await apiFetch(`/iam/accounts/${encodeURIComponent(accountId)}/rotate`, { method: "POST" });
       button.textContent = "Rotation started";
     } catch (err) {
-      setError("adError", err.message);
+      setError("iamError", err.message);
       button.disabled = false;
     }
   }

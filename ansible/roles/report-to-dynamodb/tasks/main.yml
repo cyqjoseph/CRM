@@ -1,0 +1,19 @@
+# STUB — non-functional. See ansible/README.md.
+#
+# Intent: the only role that would actually touch AWS. It would POST each
+# discovered/rotated/renewed item to the deployed sync-on-prem-fn endpoint
+# (see functions/sync_on_prem/app.py), which writes it into the same
+# CertInventoryTable / IamAccountsTable the AWS-side discovery Lambdas use —
+# tagged EnvironmentTag: on-prem so the dashboard can tell AWS-origin rows
+# apart from on-prem-origin ones.
+---
+- name: TODO — read the sync endpoint URL and an auth token from Ansible Vault
+  debug:
+    msg: "STUB: not implemented — see ansible/README.md"
+
+- name: TODO — POST discovered items to {{ '{{' }} sync_endpoint_url {{ '}}' }}/sync/on-prem-data
+  uri:
+    url: "https://REPLACE_ME.example.invalid/sync/on-prem-data"
+    method: POST
+    status_code: 202
+  when: false  # STUB: never actually runs — remove this guard in a real implementation

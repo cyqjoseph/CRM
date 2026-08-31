@@ -3,7 +3,7 @@
 Two facts about this deployment make seeding a prerequisite for validating
 anything through the UI, rather than a convenience:
 
-1. Every read endpoint scopes to the caller. `GET /certs` and `GET /ad-accounts`
+1. Every read endpoint scopes to the caller. `GET /certs` and `GET /iam/accounts`
    query OwnerIndex with `OwnerId = <the caller's Cognito sub>`. Discovery, by
    contrast, derives OwnerId from an ACM domain name, an IAM server-cert path or
    a `crm:owner-id` tag — never a Cognito sub. So rows written by a perfectly
@@ -11,7 +11,7 @@ anything through the UI, rather than a convenience:
    in the UI says nothing about whether the pipeline works.
 
 2. Both OwnerIndex definitions have a RANGE key (ExpiryDate for certs,
-   NextRotationDate for AD accounts). DynamoDB omits an item from a GSI entirely
+   NextRotationDate for IAM accounts). DynamoDB omits an item from a GSI entirely
    when it lacks that index's range key, silently — so a seeded row missing it
    would return no error and still never appear.
 
@@ -65,9 +65,9 @@ def test_seeded_certs_carry_the_owner_index_range_key():
     )
 
 
-def test_seeded_ad_accounts_carry_the_owner_index_range_key():
+def test_seeded_iam_accounts_carry_the_owner_index_range_key():
     assert "NextRotationDate" in SEED_CODE, (
-        "AD OwnerIndex has NextRotationDate as its RANGE key — an item without "
+        "IAM OwnerIndex has NextRotationDate as its RANGE key — an item without "
         "it is silently absent from the index"
     )
 
@@ -75,7 +75,7 @@ def test_seeded_ad_accounts_carry_the_owner_index_range_key():
 def test_seed_writes_to_all_three_tables():
     for table in (
         "app-d9fae51c-1929cc69-cert-inventory",
-        "app-d9fae51c-1929cc69-ad-inventory",
+        "app-d9fae51c-1929cc69-iam-accounts",
         "app-d9fae51c-1929cc69-audit-hot",
     ):
         assert table in SEED_CODE, f"seed.sh does not write to {table}"

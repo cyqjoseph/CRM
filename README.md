@@ -9,60 +9,71 @@ Pushes to `main` trigger an automatic redeploy.
 ## What this is
 
 A serverless app that discovers, tracks and rotates two kinds of expiring
-credentials across an organisation:
+credentials across an organisation, building toward one unified inventory
+dashboard:
 
 - **TLS/x.509 certificates** — discovered from ACM, IAM server certificates,
-  and Secrets Manager (tagged `crm:resource-type=certificate`). ACM certs can
-  be auto-renewed; other cert types are tracked but renewed manually.
-- **On-prem AD service-account passwords** — discovered and rotated by a
-  containerised agent (simulated on-prem AD connectivity, see Deviations
-  below) run as an ECS Fargate task.
+  and Secrets Manager (tagged `crm:resource-type=certificate`), plus a small
+  set of simulated ACM certificates correlated to 3 EC2 `t3.micro` test
+  instances (`deploy.sh` creates both; see Deviations below for why the ACM
+  certs are simulated rather than real). ACM certs can be auto-renewed; other
+  cert types are tracked but renewed manually.
+- **AWS IAM users' access keys** — discovered by scanning IAM for active
+  access keys and flagging any older than 90 days ("warning") or 180 days
+  ("critical"). "Rotation" flags the account and notifies rather than
+  mutating a live key — see Deviations below.
+- **On-prem AD accounts / ADCS certificates** — sketched as non-functional
+  Ansible stubs in `ansible/` for a future implementer; nothing there runs
+  today (no on-prem network path exists from this sandbox account). See
+  `ansible/README.md`.
 
-Both inventories are scanned hourly for upcoming expiry. Matches fan out to
-an SNS alert (by severity) and a Jira ticket-creation request (via SQS),
-independently of each other. Every lifecycle event is appended to an
-append-only "hot" audit table (90-day TTL) and streamed to S3 for long-term
-archival (7yr for AD events, 3yr for certs) before it expires out of
-DynamoDB.
+Both AWS-side inventories are scanned daily for upcoming expiry/rotation.
+Matches fan out to an SNS alert (by severity) and a Jira ticket-creation
+request (via SQS), independently of each other. Every lifecycle event is
+appended to an append-only "hot" audit table (90-day TTL) and streamed to S3
+for long-term archival (7yr for IAM-account events, 3yr for certs) before it
+expires out of DynamoDB.
 
 A small static single-page app (Cognito-authenticated) lets an owner view
-their certs/AD accounts and trigger a renewal or rotation on demand; admins
+their certs/IAM accounts and trigger a renewal or rotation on demand; admins
 can additionally query the full audit trail for any entity.
 
 ## Architecture
 
-- **Discovery**: `discovery-acm-fn` (ACM/IAM/Secrets Manager, daily) and
-  `discovery-ad-trigger-fn` (launches the `ad-agent` Fargate task, daily) —
+- **Discovery**: `discovery-acm-fn` (ACM/IAM server certs/Secrets Manager,
+  daily) and `discovery-iam-fn` (scans IAM users' access keys, daily) —
   orchestrated by the `discovery` Step Functions state machine.
 - **Evaluation**: `expiry-evaluator-fn` runs hourly, queries both inventory
   tables' GSIs for items inside the alert horizon, and independently
   publishes to SNS and sends to the Jira SQS queue per match.
 - **Remediation**: `renewal` state machine (ACM-only auto-renew via
-  `renewal-executor-fn`) and `rotation` state machine (re-runs the
-  `ad-agent` Fargate task to rotate a single account) — both can be
-  triggered on a schedule match or on-demand via the API.
+  `renewal-executor-fn`) and `rotation` state machine (invokes
+  `rotation-iam-key-fn`, which flags a single IAM account rather than
+  mutating its key — see Deviations) — both can be triggered on a schedule
+  match or on-demand via the API.
 - **Notification**: `jira-notifier-fn` consumes the SQS queue (batch size 1)
   and creates a Jira ticket per message; a non-2xx response raises, so SQS's
   own redrive policy (`maxReceiveCount: 3`) moves the message to a DLQ
   without any custom retry logic in the function.
-- **API**: `api-certs-fn`, `api-ad-fn`, `api-audit-fn` behind API Gateway
+- **API**: `api-certs-fn`, `api-iam-fn`, `api-audit-fn` behind API Gateway
   with a Cognito authorizer — list/get/renew/rotate endpoints scoped to the
   caller's own resources (via the Cognito `sub` claim), plus an
-  admin-only cross-owner audit query.
+  admin-only cross-owner audit query. `sync-on-prem-fn` is a stub write
+  proxy (`POST /sync/on-prem-data`) for the future on-prem Ansible
+  integration to target — see Deviations.
 - **Audit**: `audit-exporter-fn` consumes the audit-hot table's DynamoDB
   Stream and writes each event to S3 under
-  `{cert|ad-account}/{yyyy}/{mm}/{dd}/{entityId}-{eventTimestamp}.json`
+  `{cert|iam-account}/{yyyy}/{mm}/{dd}/{entityId}-{eventTimestamp}.json`
   before the item's TTL deletes it from DynamoDB.
 - **UI**: a static HTML/CSS/JS site (Cognito SRP auth via
   `amazon-cognito-identity-js`, no build step) served from S3 through
   CloudFront with an Origin Access Control.
 
 All infrastructure is defined in `template.yaml` (AWS SAM). `deploy.sh`
-builds and deploys the stack, builds/pushes the `ad-agent` container image,
-syncs the UI to S3, writes `ui/config.js` with the deployed Cognito/API
-values, and invalidates the CloudFront cache. `destroy.sh` tears everything
-down, including the two resources CloudFormation never owns: the ECR
-repository and the S3 buckets' contents.
+builds and deploys the stack, creates 3 EC2 `t3.micro` test instances and
+seeds simulated ACM certificate rows correlated to their instance IDs, syncs
+the UI to S3, writes `ui/config.js` with the deployed Cognito/API values, and
+invalidates the CloudFront cache. `destroy.sh` tears everything down.
 
 ### Re-deploy safety: Secrets Manager's recovery window
 
@@ -72,12 +83,18 @@ secret's name stays reserved for that entire window. A later deploy that
 re-creates the same name therefore fails immediately with *"already scheduled
 for deletion"*.
 
-This one is unusually hard to diagnose. `AdBindSecret` and `JiraTokenSecret`
-have no dependencies, so CloudFormation creates them in its **first** wave,
-next to the DynamoDB tables, S3 buckets, SNS topics and SQS queues. When a
-first-wave resource fails, every sibling in that wave is stamped only
+This one is unusually hard to diagnose. `JiraTokenSecret` has no
+dependencies, so CloudFormation creates it in its **first** wave, next to the
+DynamoDB tables, S3 buckets, SNS topics and SQS queues. When a first-wave
+resource fails, every sibling in that wave is stamped only
 `Resource creation cancelled` — so the build log shows a large cascade of
 cancellations and no root cause.
+
+`TestInstanceRegistrySecret` (holding the 3 simulated test-instance IDs) is a
+second, unavoidable exception: it depends on those EC2 instances existing
+first, so it deliberately sits in a *later* creation wave rather than the
+first one — this is intentional, not a bug to fix, since a secret referencing
+resources that don't exist yet would itself fail to create.
 
 Both scripts now handle it:
 
@@ -108,11 +125,42 @@ authoritative. Concretely:
   spec's SAML federation — this account has no external IdP to federate
   with, and CLAUDE.md's Auth section explicitly asks for minimal auth on
   hackathon prototypes.
-- **AD connectivity**: the `ad-agent` Fargate task runs in the account's
-  public subnets with `assignPublicIp: ENABLED` and simulates on-prem AD
-  discovery/rotation, rather than reaching a real LDAP/ADWS server over
-  Direct Connect/VPN — no such connectivity exists in this sandbox, and
-  there is no NAT gateway available for a private-subnet placement.
+- **On-prem AD replaced with AWS IAM discovery**: the original design's
+  on-prem AD account discovery/rotation (an ECS Fargate `ad-agent` container)
+  has been removed entirely — there is no on-prem network path from this
+  sandbox account, and CLAUDE.md's allowed-services list has no Directory
+  Service. In its place, `discovery-iam-fn` scans real AWS IAM users' access
+  keys and flags any older than 90/180 days, using the same Step
+  Functions/DynamoDB/API shape the AD design had. The on-prem case is not
+  abandoned, just deferred: `ansible/` holds non-functional stubs (inventories,
+  roles, playbooks, a template-only IAM policy) sketching how a future
+  on-prem Ansible agent would discover/rotate AD accounts and ADCS
+  certificates and push them into the same tables via the new
+  `POST /sync/on-prem-data` stub endpoint. Nothing in `ansible/` executes,
+  installs a dependency, or is invoked by `deploy.sh`/`destroy.sh`.
+- **Simulated rather than real ACM certificate issuance**: `deploy.sh`
+  creates 3 EC2 `t3.micro` test instances and writes simulated certificate
+  rows (90-day expiry, `Source: AWS_ACM`, correlated to an instance ID) via
+  `dynamodb put-item` rather than real `acm:RequestCertificate` calls.
+  Issuing a real public ACM certificate requires proving ownership of a real
+  domain, which is infeasible for invented hostnames in a sandbox account —
+  simulating the row is the only way to populate the certificate inventory
+  with realistic-looking EC2-correlated data at all. `destroy.sh` terminates
+  the same instances and removes the registry secret.
+- **IAM key "rotation" flags rather than mutates**: `rotation-iam-key-fn`
+  makes zero IAM API calls (no `CreateAccessKey`/`DeactivateAccessKey`/
+  `DeleteAccessKey`). Automatically deactivating or deleting a live access
+  key is a high-blast-radius, hard-to-reverse action — anything still using
+  that key breaks immediately, with no warning and no rollback. The function
+  only records that the account was flagged (`mode: "NOTIFY_ONLY"`);
+  completing the actual rotation is left as a deliberate, human, out-of-band
+  step. The on-prem `rotate-ad-passwords` Ansible stub documents the same
+  posture for its own future implementation.
+- **On-prem sync is a stub, not a real integration**: `sync-on-prem-fn`
+  (`POST /sync/on-prem-data`) accepts a `{table, item}` payload and writes it
+  to the named table with no real validation — it exists only so the
+  `ansible/roles/report-to-dynamodb` stub has a concrete target to call once
+  it is implemented; nothing calls it today.
 - **Owner scoping**: enforced in each API Lambda's application code by
   comparing the resource's `OwnerId` to the Cognito JWT's `sub` claim,
   rather than via IAM-level DynamoDB `LeadingKeys` conditions. This
@@ -150,7 +198,8 @@ about what `OwnerId` means.**
 | `discovery_acm` (ACM) | the certificate's `DomainName` |
 | `discovery_acm` (IAM) | the server certificate's `Path` |
 | `discovery_acm` (Secrets Manager) | the `crm:owner-id` tag |
-| `GET /certs`, `GET /ad-accounts` | the caller's Cognito `sub` (a UUID) |
+| `discovery_iam` | the IAM user's `Path` |
+| `GET /certs`, `GET /iam/accounts` | the caller's Cognito `sub` (a UUID) |
 
 Both index the same GSI (`OwnerIndex`), so a completely healthy discovery run
 writes rows that belong to no human login and therefore appear in **nobody's**
@@ -159,13 +208,13 @@ about whether the pipeline works — which is exactly why `seed.sh` exists.
 
 `scripts/seed.sh` resolves a real Cognito `sub` via `admin-get-user` and writes
 rows owned by it: five certificates spanning all three bands the UI colours
-(`≤7d` red, `≤30d` amber, else green), three AD accounts, and three audit events.
-Every id starts with `seed-`, and `--clean` deletes only those ids, so it can
-never remove a genuinely discovered certificate.
+(`≤7d` red, `≤30d` amber, else green), three IAM accounts, and three audit
+events. Every id starts with `seed-`, and `--clean` deletes only those ids, so
+it can never remove a genuinely discovered certificate.
 
 Two GSI details make seeding by hand error-prone, and are asserted in
 `test_seed_script.py`: `OwnerIndex` has a RANGE key on both tables (`ExpiryDate`
-for certs, `NextRotationDate` for AD accounts), and DynamoDB omits an item from
+for certs, `NextRotationDate` for IAM accounts), and DynamoDB omits an item from
 an index entirely — silently, with no error on write — when it lacks that index's
 range key. A row missing it is accepted by `PutItem` and then never returned by
 `GET /certs`.
@@ -182,8 +231,10 @@ parses `template.yaml` with a small custom YAML loader (handles CFN's
 `!Ref`/`!GetAtt`/`!Sub`/`!Join` short-form tags) to check things a runtime
 test can't: every required API route is wired up, tracing is enabled
 everywhere, no IAM statement grants a wildcard `Resource` outside AWS's
-documented cases, `iam:PassRole` is always scoped to named role ARNs, and
-every resource name/SSM path carries the mandated prefix (including
+documented cases, any `iam:PassRole` statement (there are currently none —
+the ECS/Fargate design that needed one was removed) is scoped to named role
+ARNs rather than a wildcard, and every resource name/SSM path carries the
+mandated prefix (including
 `LogGroupName` — a log group named `/ecs/app-...` previously slipped past this
 check because that property wasn't in the list).
 
@@ -244,23 +295,44 @@ The reason the above took so long to find is that a 502 is *information-free* in
 a browser: API Gateway generates it, so it carries none of the CORS headers the
 function would have set, and the real exception exists only in CloudWatch.
 
-`crm_common.guard_api_handler` now wraps the three browser-facing handlers
-(`api_certs`, `api_ad`, `api_audit`). It prints the traceback to stderr — so it
-still lands in CloudWatch — and returns a well-formed `500` with the CORS header
-intact and a generic `{"message": "internal error"}` body, so the UI can display
+`crm_common.guard_api_handler` now wraps the browser-facing, API
+Gateway-fronted handlers (`api_certs`, `api_iam`, `api_audit`,
+`sync_on_prem`). It prints the traceback to stderr — so it still lands in
+CloudWatch — and returns a well-formed `500` with the CORS header intact and
+a generic `{"message": "internal error"}` body, so the UI can display
 something and the failure is never mistaken for a CORS problem again.
 
 The event-driven functions (`expiry_evaluator`, `jira_notifier`,
-`discovery_ad_trigger`, `renewal_executor`, `audit_exporter`) deliberately do
-**not** use the guard: they must keep raising, or Step Functions retries and
-SQS redrive-to-DLQ stop working. `test_error_handling.py` asserts both
-behaviours.
+`discovery_iam`, `renewal_executor`, `rotation_iam_key`, `audit_exporter`)
+deliberately do **not** use the guard: they must keep raising, or Step
+Functions retries and SQS redrive-to-DLQ stop working. `test_error_handling.py`
+asserts both behaviours.
 
 A related 502 vector was closed at the same time: `GET /certs` and
-`GET /ad-accounts` query `OwnerIndex` on the caller's Cognito `sub`, and
+`GET /iam/accounts` query `OwnerIndex` on the caller's Cognito `sub`, and
 DynamoDB rejects an empty string as a key value with `ValidationException`. An
 absent `sub` therefore raised rather than returning an empty list. Both handlers
 now return `401` before making the call.
+
+### CloudWatch Logs permissions on first invocation
+
+Every Lambda function's execution role now grants `logs:CreateLogGroup`,
+`logs:CreateLogStream`, `logs:PutLogEvents`, `logs:DescribeLogGroups` and
+`logs:DescribeLogStreams` with `Resource: "*"`. This fixes `log group
+'/aws/lambda/app-d9fae51c-1929cc69-api-audit-fn' does not exist` and its
+equivalent on every other function: a function's log group does not exist
+until its *first* invocation creates it, so a policy scoped to that group's
+ARN denies the very call that would create it. These 5 actions are the one
+documented AWS action set where a resource-level ARN cannot work around that
+ordering problem, which is why they are listed in `test_template.py`'s
+`MANDATORY_WILDCARD_ACTIONS` alongside the small set of IAM/ACM/Secrets
+Manager list/describe actions that AWS documents as never supporting
+resource-level scoping at all.
+
+The statement is repeated in each of the 11 functions' own `Policies` list
+rather than declared once in `Globals.Function` — SAM's `Globals.Function`
+section does not support a `Policies` property at all (`cfn-lint` rejects it
+with `E3724`), so there is no single place to declare it.
 
 ### YAML 1.1 boolean aliases
 

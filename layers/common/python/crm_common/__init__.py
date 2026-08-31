@@ -50,7 +50,7 @@ def put_audit_event(entity_id, event_type, actor, outcome, detail=None, table_na
 
 
 def hash_identifier(value):
-    """One-way hash for AD account identifiers; never store plaintext identifiers."""
+    """One-way hash for account identifiers; never store plaintext identifiers."""
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
@@ -81,7 +81,7 @@ def guard_api_handler(handler):
     exists only in CloudWatch. A well-formed 500 keeps the CORS header and gives
     the UI something to display, while the traceback still reaches the log.
 
-    Only for the three API handlers. The event-driven functions must keep
+    Only for API Gateway-fronted handlers. The event-driven functions must keep
     raising, or Step Functions retries and SQS redrive-to-DLQ stop working.
     """
 

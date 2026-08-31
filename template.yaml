@@ -1,14 +1,12 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  Centralised Resource Manager Cross-Environments — certificate and AD account
-  lifecycle discovery, expiry alerting, renewal/rotation, and a self-service
-  audited UI. See spec/ and docs/ for the approved requirements/design.
+  Centralised Resource Manager Cross-Environments — certificate and IAM/AD
+  account lifecycle discovery, expiry alerting, renewal/rotation, and a
+  self-service audited UI. See spec/ and docs/ for the approved
+  requirements/design.
 
 Parameters:
-  AdAgentImageUri:
-    Type: String
-    Description: ECR image URI for the ad-agent Fargate container, built and pushed by deploy.sh.
   VpcId:
     Type: AWS::EC2::VPC::Id
     Default: vpc-01d3b02b0f1c07aa0
@@ -21,6 +19,10 @@ Parameters:
     Type: String
     Default: https://example.atlassian.net
     Description: Base URL of the Jira Cloud instance tickets are created in.
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Current Amazon Linux 2023 AMI, resolved at deploy time — never a hardcoded AMI id.
 
 Globals:
   Function:
@@ -36,6 +38,23 @@ Globals:
         CORS_ALLOW_ORIGIN: "*"
     Layers:
       - !Ref CommonLayer
+
+# Every function needs to create its own /aws/lambda/<name> log group and
+# stream on first invocation — Lambda does not pre-create them. Globals.Function
+# does not support a Policies property (SAM rejects it), so this statement is
+# repeated on every function's own Policies list below instead of declared once
+# here. Resource is deliberately "*", not scoped to a log group ARN: Lambda's
+# own execution environment calls these APIs before the log group exists, so a
+# resource-scoped grant would still be denied on the very first invocation.
+#   - Statement:
+#       - Effect: Allow
+#         Action:
+#           - logs:CreateLogGroup
+#           - logs:CreateLogStream
+#           - logs:PutLogEvents
+#           - logs:DescribeLogGroups
+#           - logs:DescribeLogStreams
+#         Resource: "*"
 
 Resources:
   # ---------------------------------------------------------------------------
@@ -97,10 +116,10 @@ Resources:
           Projection:
             ProjectionType: ALL
 
-  AdInventoryTable:
+  IamAccountsTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: app-d9fae51c-1929cc69-ad-inventory
+      TableName: app-d9fae51c-1929cc69-iam-accounts
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: AccountIdHash
@@ -109,7 +128,7 @@ Resources:
           AttributeType: S
         - AttributeName: NextRotationDate
           AttributeType: S
-        - AttributeName: RotationStatus
+        - AttributeName: Status
           AttributeType: S
       KeySchema:
         - AttributeName: AccountIdHash
@@ -123,9 +142,9 @@ Resources:
               KeyType: RANGE
           Projection:
             ProjectionType: ALL
-        - IndexName: RotationIndex
+        - IndexName: StatusIndex
           KeySchema:
-            - AttributeName: RotationStatus
+            - AttributeName: Status
               KeyType: HASH
             - AttributeName: NextRotationDate
               KeyType: RANGE
@@ -171,9 +190,9 @@ Resources:
         RestrictPublicBuckets: true
       LifecycleConfiguration:
         Rules:
-          - Id: ad-account-retention-7yr
+          - Id: iam-account-retention-7yr
             Status: Enabled
-            Prefix: ad-account/
+            Prefix: iam-account/
             ExpirationInDays: 2555
           - Id: cert-retention-3yr
             Status: Enabled
@@ -393,23 +412,31 @@ Resources:
   # ---------------------------------------------------------------------------
   # Secrets Manager + SSM
   # ---------------------------------------------------------------------------
-  AdBindSecret:
-    Type: AWS::SecretsManager::Secret
-    Properties:
-      Name: app-d9fae51c-1929cc69-ad-bind-creds
-      Description: On-prem AD bind service-account credentials used by the ad-agent Fargate task.
-      GenerateSecretString:
-        SecretStringTemplate: '{"username":"svc-crm-bind"}'
-        GenerateStringKey: password
-        PasswordLength: 32
-        ExcludePunctuation: true
-
   JiraTokenSecret:
     Type: AWS::SecretsManager::Secret
     Properties:
       Name: app-d9fae51c-1929cc69-jira-token
       Description: Jira Cloud API token used by the jira-notifier function. Replace the placeholder after deploy.
       SecretString: '{"token":"REPLACE_ME"}'
+
+  # Registry of the simulated EC2 test instances + the (simulated) certificate
+  # identifiers correlated to them. This has a real dependency on the three
+  # instances below (via !Sub), so CloudFormation creates it AFTER them —
+  # unlike JiraTokenSecret, it is not in the first creation wave, and does not
+  # need to be part of that cancellation-cascade failure mode. It still needs
+  # the same scheduled-deletion purge handling in deploy.sh/destroy.sh, since
+  # nothing else about Secrets Manager's recovery window changes.
+  TestInstanceRegistrySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: app-d9fae51c-1929cc69-test-instance-registry
+      Description: Registry of simulated EC2 test instances and their correlated simulated certificate ids.
+      SecretString: !Sub |
+        {"instances":[
+          {"name":"crm-test-1","instanceId":"${TestInstance1}","hostname":"crm-test-1.internal.example.com","certId":"sim-cert-crm-test-1"},
+          {"name":"crm-test-2","instanceId":"${TestInstance2}","hostname":"crm-test-2.internal.example.com","certId":"sim-cert-crm-test-2"},
+          {"name":"crm-test-3","instanceId":"${TestInstance3}","hostname":"crm-test-3.internal.example.com","certId":"sim-cert-crm-test-3"}
+        ]}
 
   ThresholdLowParam:
     Type: AWS::SSM::Parameter
@@ -447,129 +474,70 @@ Resources:
       Value: "90"
 
   # ---------------------------------------------------------------------------
-  # ECS Fargate: on-prem AD discovery/rotation task
+  # EC2: simulated on-prem-like test instances, each with a simulated cert
   # ---------------------------------------------------------------------------
-  EcsCluster:
-    Type: AWS::ECS::Cluster
-    Properties:
-      ClusterName: app-d9fae51c-1929cc69-cluster
-
-  AdTaskSecurityGroup:
+  # These stand in for real ACM certificates on real hosts. A genuine ACM
+  # certificate cannot be issued for an invented hostname like
+  # "crm-test-1.internal.example.com" — public ACM issuance requires DNS or
+  # email domain-ownership validation, and Route 53 / a real DNS zone for this
+  # domain is not part of this project. The certificate rows below are
+  # therefore simulated inventory metadata (written by deploy.sh), correlated
+  # to these real EC2 instances by instance id, not real acm:RequestCertificate
+  # calls. See README.md's Deviations section.
+  TestInstanceSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupName: app-d9fae51c-1929cc69-ad-task-sg
-      GroupDescription: Egress-only security group for the ad-agent Fargate task (no inbound needed).
+      GroupName: app-d9fae51c-1929cc69-test-instance-sg
+      GroupDescription: Egress-only security group for the simulated EC2 test instances (no inbound needed).
       VpcId: !Ref VpcId
       SecurityGroupEgress:
         - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
           CidrIp: 0.0.0.0/0
-          Description: AWS API calls (ECR pull, DynamoDB, Secrets Manager)
-        - IpProtocol: tcp
-          FromPort: 636
-          ToPort: 636
-          CidrIp: 0.0.0.0/0
-          Description: LDAPS to on-prem AD
+          Description: AWS API calls (SSM agent, if attached later)
 
-  AdTaskLogGroup:
-    Type: AWS::Logs::LogGroup
+  TestInstance1:
+    Type: AWS::EC2::Instance
     Properties:
-      # Must start with the mandated prefix, so no leading /ecs/ path segment:
-      # the deploy role's logs:CreateLogGroup grant is scoped by name.
-      LogGroupName: app-d9fae51c-1929cc69-ad-agent
-      RetentionInDays: 30
+      ImageId: !Ref LatestAmiId
+      InstanceType: t3.micro
+      SubnetId: !Select [0, !Ref SubnetIds]
+      SecurityGroupIds:
+        - !GetAtt TestInstanceSecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: app-d9fae51c-1929cc69-test-instance-1
+        - Key: crm-tracked-instance
+          Value: "true"
 
-  AdTaskExecutionRole:
-    Type: AWS::IAM::Role
+  TestInstance2:
+    Type: AWS::EC2::Instance
     Properties:
-      RoleName: app-d9fae51c-1929cc69-ad-task-exec-role
-      PermissionsBoundary: arn:aws:iam::544635841962:policy/brd-architect-deploy-boundary
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: ecs-tasks.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: ad-task-exec-policy
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action: ecr:GetAuthorizationToken
-                Resource: "*"
-              - Effect: Allow
-                Action:
-                  - ecr:BatchGetImage
-                  - ecr:GetDownloadUrlForLayer
-                Resource: !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/app-d9fae51c-1929cc69-ad-agent"
-              - Effect: Allow
-                Action:
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource: !GetAtt AdTaskLogGroup.Arn
+      ImageId: !Ref LatestAmiId
+      InstanceType: t3.micro
+      SubnetId: !Select [1, !Ref SubnetIds]
+      SecurityGroupIds:
+        - !GetAtt TestInstanceSecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: app-d9fae51c-1929cc69-test-instance-2
+        - Key: crm-tracked-instance
+          Value: "true"
 
-  AdTaskRole:
-    Type: AWS::IAM::Role
+  TestInstance3:
+    Type: AWS::EC2::Instance
     Properties:
-      RoleName: app-d9fae51c-1929cc69-ad-task-role
-      PermissionsBoundary: arn:aws:iam::544635841962:policy/brd-architect-deploy-boundary
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: ecs-tasks.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: ad-task-policy
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action: secretsmanager:GetSecretValue
-                Resource: !Ref AdBindSecret
-              - Effect: Allow
-                Action:
-                  - dynamodb:PutItem
-                  - dynamodb:UpdateItem
-                Resource: !GetAtt AdInventoryTable.Arn
-              - Effect: Allow
-                Action: dynamodb:PutItem
-                Resource: !GetAtt AuditHotTable.Arn
-
-  AdTaskDefinition:
-    Type: AWS::ECS::TaskDefinition
-    Properties:
-      Family: app-d9fae51c-1929cc69-ad-task-def
-      RequiresCompatibilities:
-        - FARGATE
-      NetworkMode: awsvpc
-      Cpu: "256"
-      Memory: "512"
-      ExecutionRoleArn: !GetAtt AdTaskExecutionRole.Arn
-      TaskRoleArn: !GetAtt AdTaskRole.Arn
-      ContainerDefinitions:
-        - Name: ad-agent
-          Image: !Ref AdAgentImageUri
-          Essential: true
-          Environment:
-            - Name: AD_TABLE_NAME
-              Value: !Ref AdInventoryTable
-            - Name: AUDIT_TABLE_NAME
-              Value: !Ref AuditHotTable
-            - Name: AD_BIND_SECRET_ARN
-              Value: !Ref AdBindSecret
-            - Name: AD_DOMAIN
-              Value: corp.example.internal
-          LogConfiguration:
-            LogDriver: awslogs
-            Options:
-              awslogs-group: !Ref AdTaskLogGroup
-              awslogs-region: !Ref AWS::Region
-              awslogs-stream-prefix: ad-agent
+      ImageId: !Ref LatestAmiId
+      InstanceType: t3.micro
+      SubnetId: !Select [2, !Ref SubnetIds]
+      SecurityGroupIds:
+        - !GetAtt TestInstanceSecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: app-d9fae51c-1929cc69-test-instance-3
+        - Key: crm-tracked-instance
+          Value: "true"
 
   # ---------------------------------------------------------------------------
   # Lambda functions
@@ -595,35 +563,43 @@ Resources:
                 - secretsmanager:DescribeSecret
                 - iam:ListServerCertificates
               Resource: "*"
-
-  DiscoveryAdTriggerFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: app-d9fae51c-1929cc69-discovery-ad-trigger-fn
-      CodeUri: functions/discovery_ad_trigger/
-      Handler: app.handler
-      Timeout: 900
-      Environment:
-        Variables:
-          ECS_CLUSTER_ARN: !GetAtt EcsCluster.Arn
-          AD_TASK_DEFINITION: !Ref AdTaskDefinition
-          SUBNET_IDS: !Join [",", !Ref SubnetIds]
-          AD_TASK_SECURITY_GROUP_ID: !GetAtt AdTaskSecurityGroup.GroupId
-      Policies:
         - Statement:
             - Effect: Allow
-              Action: ecs:RunTask
-              Resource: !Ref AdTaskDefinition
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                - logs:DescribeLogGroups
+                - logs:DescribeLogStreams
+              Resource: "*"
+
+  DiscoveryIamFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: app-d9fae51c-1929cc69-discovery-iam-fn
+      CodeUri: functions/discovery_iam/
+      Handler: app.handler
+      Environment:
+        Variables:
+          IAM_TABLE_NAME: !Ref IamAccountsTable
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref IamAccountsTable
+        - Statement:
             - Effect: Allow
               Action:
-                - ecs:DescribeTasks
-                - ecs:StopTask
-              Resource: !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task/app-d9fae51c-1929cc69-cluster/*"
+                - iam:ListUsers
+                - iam:ListAccessKeys
+              Resource: "*"
+        - Statement:
             - Effect: Allow
-              Action: iam:PassRole
-              Resource:
-                - !GetAtt AdTaskExecutionRole.Arn
-                - !GetAtt AdTaskRole.Arn
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                - logs:DescribeLogGroups
+                - logs:DescribeLogStreams
+              Resource: "*"
 
   ExpiryEvaluatorFunction:
     Type: AWS::Serverless::Function
@@ -634,7 +610,7 @@ Resources:
       Environment:
         Variables:
           CERT_TABLE_NAME: !Ref CertInventoryTable
-          AD_TABLE_NAME: !Ref AdInventoryTable
+          IAM_TABLE_NAME: !Ref IamAccountsTable
           AUDIT_TABLE_NAME: !Ref AuditHotTable
           JIRA_QUEUE_URL: !Ref JiraQueue
           SNS_TOPIC_LOW: !Ref AlertsLowTopic
@@ -644,7 +620,7 @@ Resources:
         - DynamoDBReadPolicy:
             TableName: !Ref CertInventoryTable
         - DynamoDBReadPolicy:
-            TableName: !Ref AdInventoryTable
+            TableName: !Ref IamAccountsTable
         - DynamoDBWritePolicy:
             TableName: !Ref AuditHotTable
         - SNSPublishMessagePolicy:
@@ -655,6 +631,15 @@ Resources:
             TopicName: !GetAtt AlertsHighTopic.TopicName
         - SQSSendMessagePolicy:
             QueueName: !GetAtt JiraQueue.QueueName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                - logs:DescribeLogGroups
+                - logs:DescribeLogStreams
+              Resource: "*"
 
   RenewalExecutorFunction:
     Type: AWS::Serverless::Function
@@ -674,6 +659,39 @@ Resources:
                 - acm:RenewCertificate
                 - acm:DescribeCertificate
               Resource: !Sub "arn:aws:acm:${AWS::Region}:${AWS::AccountId}:certificate/*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                - logs:DescribeLogGroups
+                - logs:DescribeLogStreams
+              Resource: "*"
+
+  # Backs the "rotate" action for IAM access keys. Deliberately does NOT call
+  # CreateAccessKey/DeactivateAccessKey/DeleteAccessKey against a real IAM user
+  # — mutating live credentials automatically (e.g. from a UI button or a
+  # schedule) is a high-blast-radius, hard-to-reverse action that could break a
+  # production caller using that key. It only flags the account for rotation;
+  # a human completes the actual key rotation out of band. See README.md's
+  # Deviations section.
+  RotationIamKeyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: app-d9fae51c-1929cc69-rotation-iam-key-fn
+      CodeUri: functions/rotation_iam_key/
+      Handler: app.handler
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                - logs:DescribeLogGroups
+                - logs:DescribeLogStreams
+              Resource: "*"
 
   JiraNotifierFunction:
     Type: AWS::Serverless::Function
@@ -690,6 +708,15 @@ Resources:
             - Effect: Allow
               Action: secretsmanager:GetSecretValue
               Resource: !Ref JiraTokenSecret
+        - Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                - logs:DescribeLogGroups
+                - logs:DescribeLogStreams
+              Resource: "*"
       Events:
         JiraQueueEvent:
           Type: SQS
@@ -717,6 +744,15 @@ Resources:
             - Effect: Allow
               Action: states:StartExecution
               Resource: !Ref RenewalSfn
+        - Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                - logs:DescribeLogGroups
+                - logs:DescribeLogStreams
+              Resource: "*"
       Events:
         ListCerts:
           Type: Api
@@ -737,44 +773,53 @@ Resources:
             Path: /certs/{certId}/renew
             Method: post
 
-  ApiAdFunction:
+  ApiIamFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: app-d9fae51c-1929cc69-api-ad-fn
-      CodeUri: functions/api_ad/
+      FunctionName: app-d9fae51c-1929cc69-api-iam-fn
+      CodeUri: functions/api_iam/
       Handler: app.handler
       Environment:
         Variables:
-          AD_TABLE_NAME: !Ref AdInventoryTable
+          IAM_TABLE_NAME: !Ref IamAccountsTable
           AUDIT_TABLE_NAME: !Ref AuditHotTable
           ROTATION_STATE_MACHINE_ARN: !Ref RotationSfn
       Policies:
         - DynamoDBReadPolicy:
-            TableName: !Ref AdInventoryTable
+            TableName: !Ref IamAccountsTable
         - DynamoDBWritePolicy:
             TableName: !Ref AuditHotTable
         - Statement:
             - Effect: Allow
               Action: states:StartExecution
               Resource: !Ref RotationSfn
+        - Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                - logs:DescribeLogGroups
+                - logs:DescribeLogStreams
+              Resource: "*"
       Events:
-        ListAdAccounts:
+        ListIamAccounts:
           Type: Api
           Properties:
             RestApiId: !Ref CrmApi
-            Path: /ad-accounts
+            Path: /iam/accounts
             Method: get
-        GetAdAccount:
+        GetIamAccount:
           Type: Api
           Properties:
             RestApiId: !Ref CrmApi
-            Path: /ad-accounts/{accountId}
+            Path: /iam/accounts/{accountId}
             Method: get
-        RotateAdAccount:
+        RotateIamAccount:
           Type: Api
           Properties:
             RestApiId: !Ref CrmApi
-            Path: /ad-accounts/{accountId}/rotate
+            Path: /iam/accounts/{accountId}/rotate
             Method: post
 
   ApiAuditFunction:
@@ -796,6 +841,15 @@ Resources:
                 - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${DiscoverySfn.Name}:*"
                 - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${RenewalSfn.Name}:*"
                 - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${RotationSfn.Name}:*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                - logs:DescribeLogGroups
+                - logs:DescribeLogStreams
+              Resource: "*"
       Events:
         GetAudit:
           Type: Api
@@ -810,6 +864,42 @@ Resources:
             Path: /executions/{executionId}
             Method: get
 
+  # Stub proxy for future on-prem (Ansible-driven) inventory sync. Passes the
+  # request body straight through to DynamoDB with no validation — see
+  # ansible/README.md and the TODO in functions/sync_on_prem/app.py. Not
+  # wired to any real on-prem system; nothing today calls this route.
+  SyncOnPremFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: app-d9fae51c-1929cc69-sync-on-prem-fn
+      CodeUri: functions/sync_on_prem/
+      Handler: app.handler
+      Environment:
+        Variables:
+          CERT_TABLE_NAME: !Ref CertInventoryTable
+          IAM_TABLE_NAME: !Ref IamAccountsTable
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref CertInventoryTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref IamAccountsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                - logs:DescribeLogGroups
+                - logs:DescribeLogStreams
+              Resource: "*"
+      Events:
+        SyncOnPremData:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CrmApi
+            Path: /sync/on-prem-data
+            Method: post
+
   AuditExporterFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -822,6 +912,15 @@ Resources:
       Policies:
         - S3WritePolicy:
             BucketName: !Ref AuditArchiveBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                - logs:DescribeLogGroups
+                - logs:DescribeLogStreams
+              Resource: "*"
       Events:
         AuditStream:
           Type: DynamoDB
@@ -854,7 +953,7 @@ Resources:
                 Action: lambda:InvokeFunction
                 Resource:
                   - !GetAtt DiscoveryAcmFunction.Arn
-                  - !GetAtt DiscoveryAdTriggerFunction.Arn
+                  - !GetAtt DiscoveryIamFunction.Arn
               - Effect: Allow
                 Action: dynamodb:PutItem
                 Resource: !GetAtt AuditHotTable.Arn
@@ -866,7 +965,7 @@ Resources:
       DefinitionUri: statemachines/discovery.asl.json
       DefinitionSubstitutions:
         DiscoveryAcmFunctionArn: !GetAtt DiscoveryAcmFunction.Arn
-        DiscoveryAdTriggerFunctionArn: !GetAtt DiscoveryAdTriggerFunction.Arn
+        DiscoveryIamFunctionArn: !GetAtt DiscoveryIamFunction.Arn
         AuditTableName: !Ref AuditHotTable
       Role: !GetAtt DiscoverySfnRole.Arn
       Tracing:
@@ -930,33 +1029,17 @@ Resources:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
-                Action: ecs:RunTask
-                Resource: !Ref AdTaskDefinition
-              - Effect: Allow
-                Action:
-                  - ecs:StopTask
-                  - ecs:DescribeTasks
-                Resource: !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task/app-d9fae51c-1929cc69-cluster/*"
-              - Effect: Allow
-                Action: iam:PassRole
-                Resource:
-                  - !GetAtt AdTaskExecutionRole.Arn
-                  - !GetAtt AdTaskRole.Arn
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt RotationIamKeyFunction.Arn
               - Effect: Allow
                 Action: dynamodb:UpdateItem
-                Resource: !GetAtt AdInventoryTable.Arn
+                Resource: !GetAtt IamAccountsTable.Arn
               - Effect: Allow
                 Action: dynamodb:PutItem
                 Resource: !GetAtt AuditHotTable.Arn
               - Effect: Allow
                 Action: sns:Publish
                 Resource: !Ref CompletionsTopic
-              - Effect: Allow
-                Action:
-                  - events:PutTargets
-                  - events:PutRule
-                  - events:DescribeRule
-                Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForECSTaskRule"
 
   RotationSfn:
     Type: AWS::Serverless::StateMachine
@@ -964,13 +1047,8 @@ Resources:
       Name: app-d9fae51c-1929cc69-rotation-sfn
       DefinitionUri: statemachines/rotation.asl.json
       DefinitionSubstitutions:
-        EcsClusterArn: !GetAtt EcsCluster.Arn
-        AdTaskDefinitionArn: !Ref AdTaskDefinition
-        SubnetIdsJson: !Sub
-          - '["${SubnetsList}"]'
-          - SubnetsList: !Join ['","', !Ref SubnetIds]
-        AdTaskSecurityGroupId: !GetAtt AdTaskSecurityGroup.GroupId
-        AdTableName: !Ref AdInventoryTable
+        RotationIamKeyFunctionArn: !GetAtt RotationIamKeyFunction.Arn
+        IamTableName: !Ref IamAccountsTable
         AuditTableName: !Ref AuditHotTable
         CompletionsTopicArn: !Ref CompletionsTopic
       Role: !GetAtt RotationSfnRole.Arn
@@ -1118,15 +1196,15 @@ Resources:
       AlarmActions:
         - !Ref OpsAlarmsTopic
 
-  LambdaErrorAlarmDiscoveryAdTrigger:
+  LambdaErrorAlarmDiscoveryIam:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: app-d9fae51c-1929cc69-discovery-ad-trigger-fn-errors
+      AlarmName: app-d9fae51c-1929cc69-discovery-iam-fn-errors
       Namespace: AWS/Lambda
       MetricName: Errors
       Dimensions:
         - Name: FunctionName
-          Value: !Ref DiscoveryAdTriggerFunction
+          Value: !Ref DiscoveryIamFunction
       Statistic: Sum
       Period: 300
       EvaluationPeriods: 1
@@ -1169,6 +1247,23 @@ Resources:
       AlarmActions:
         - !Ref OpsAlarmsTopic
 
+  LambdaErrorAlarmRotationIamKey:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: app-d9fae51c-1929cc69-rotation-iam-key-fn-errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref RotationIamKeyFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref OpsAlarmsTopic
+
   LambdaErrorAlarmJiraNotifier:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -1203,15 +1298,15 @@ Resources:
       AlarmActions:
         - !Ref OpsAlarmsTopic
 
-  LambdaErrorAlarmApiAd:
+  LambdaErrorAlarmApiIam:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: app-d9fae51c-1929cc69-api-ad-fn-errors
+      AlarmName: app-d9fae51c-1929cc69-api-iam-fn-errors
       Namespace: AWS/Lambda
       MetricName: Errors
       Dimensions:
         - Name: FunctionName
-          Value: !Ref ApiAdFunction
+          Value: !Ref ApiIamFunction
       Statistic: Sum
       Period: 300
       EvaluationPeriods: 1
@@ -1229,6 +1324,23 @@ Resources:
       Dimensions:
         - Name: FunctionName
           Value: !Ref ApiAuditFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref OpsAlarmsTopic
+
+  LambdaErrorAlarmSyncOnPrem:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: app-d9fae51c-1929cc69-sync-on-prem-fn-errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SyncOnPremFunction
       Statistic: Sum
       Period: 300
       EvaluationPeriods: 1
@@ -1270,13 +1382,15 @@ Resources:
                 "region": "${AWS::Region}",
                 "metrics": [
                   ["AWS/Lambda", "Errors", "FunctionName", "${DiscoveryAcmFunction}"],
-                  ["AWS/Lambda", "Errors", "FunctionName", "${DiscoveryAdTriggerFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${DiscoveryIamFunction}"],
                   ["AWS/Lambda", "Errors", "FunctionName", "${ExpiryEvaluatorFunction}"],
                   ["AWS/Lambda", "Errors", "FunctionName", "${RenewalExecutorFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${RotationIamKeyFunction}"],
                   ["AWS/Lambda", "Errors", "FunctionName", "${JiraNotifierFunction}"],
                   ["AWS/Lambda", "Errors", "FunctionName", "${ApiCertsFunction}"],
-                  ["AWS/Lambda", "Errors", "FunctionName", "${ApiAdFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${ApiIamFunction}"],
                   ["AWS/Lambda", "Errors", "FunctionName", "${ApiAuditFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${SyncOnPremFunction}"],
                   ["AWS/Lambda", "Errors", "FunctionName", "${AuditExporterFunction}"]
                 ]
               }
@@ -1327,7 +1441,13 @@ Outputs:
     Value: !Ref UiDistribution
   CertInventoryTableName:
     Value: !Ref CertInventoryTable
-  AdInventoryTableName:
-    Value: !Ref AdInventoryTable
+  IamAccountsTableName:
+    Value: !Ref IamAccountsTable
   AuditHotTableName:
     Value: !Ref AuditHotTable
+  TestInstance1Id:
+    Value: !Ref TestInstance1
+  TestInstance2Id:
+    Value: !Ref TestInstance2
+  TestInstance3Id:
+    Value: !Ref TestInstance3

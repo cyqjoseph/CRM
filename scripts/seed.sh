@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Seeds demo certificates, AD accounts and audit events owned by a real login,
+# Seeds demo certificates, IAM accounts and audit events owned by a real login,
 # so the UI has something to show and every control can be exercised.
 #
 #   ./scripts/seed.sh you@example.com            # create the rows
@@ -7,7 +7,7 @@
 #
 # WHY THIS IS NEEDED, and not just a convenience:
 #
-# Every read endpoint is owner-scoped. GET /certs and GET /ad-accounts query
+# Every read endpoint is owner-scoped. GET /certs and GET /iam/accounts query
 # OwnerIndex with `OwnerId = <the caller's Cognito sub>`. Discovery derives
 # OwnerId from an ACM domain name, an IAM server-certificate path, or a
 # `crm:owner-id` tag — never from a Cognito sub. So rows written by a completely
@@ -27,7 +27,7 @@ cd "$(dirname "$0")/.."
 
 REGION="${REGION:-ap-southeast-1}"
 CERT_TABLE="app-d9fae51c-1929cc69-cert-inventory"
-AD_TABLE="app-d9fae51c-1929cc69-ad-inventory"
+IAM_TABLE="app-d9fae51c-1929cc69-iam-accounts"
 AUDIT_TABLE="app-d9fae51c-1929cc69-audit-hot"
 
 # shellcheck source=scripts/lib-stack-outputs.sh
@@ -71,7 +71,7 @@ pass "$TARGET_EMAIL -> sub $USER_SUB"
 # Expiry offsets deliberately span all three bands the UI colours, so seeding
 # exercises the rendering and not just the query:
 #   <= 7 days  -> status-danger    <= 30 days -> status-warn    else status-ok
-# The AD rotation rows likewise span imminent and distant.
+# The IAM rotation rows likewise span imminent and distant.
 #
 # id|domain|days-until-expiry|status
 SEED_CERTS=(
@@ -82,11 +82,11 @@ SEED_CERTS=(
   "seed-cert-long-lived|vpn.example.com|240|ISSUED"
 )
 
-# id|days-until-next-rotation|rotation-status
-SEED_AD_ACCOUNTS=(
-  "seed-ad-svc-payments|4|PENDING_ROTATION"
-  "seed-ad-svc-reporting|21|ACTIVE"
-  "seed-ad-svc-backup|88|ACTIVE"
+# id|days-until-next-rotation|status
+SEED_IAM_ACCOUNTS=(
+  "seed-iam-svc-payments|4|warning"
+  "seed-iam-svc-reporting|21|active"
+  "seed-iam-svc-backup|88|active"
 )
 
 _date_in_days() {
@@ -108,9 +108,9 @@ if [ "$CLEAN" = true ]; then
     pass "deleted $cert_id"
   done
 
-  for row in "${SEED_AD_ACCOUNTS[@]}"; do
+  for row in "${SEED_IAM_ACCOUNTS[@]}"; do
     IFS='|' read -r account_hash _ _ <<<"$row"
-    aws dynamodb delete-item --table-name "$AD_TABLE" --region "$REGION" \
+    aws dynamodb delete-item --table-name "$IAM_TABLE" --region "$REGION" \
       --key "{\"AccountIdHash\": {\"S\": \"$account_hash\"}}"
     pass "deleted $account_hash"
   done
@@ -157,24 +157,24 @@ EOF
   pass "$cert_id  ($domain, expires $expiry, ${days}d)"
 done
 
-# --- Seed AD accounts ---------------------------------------------------------
-step "Seeding AD accounts into $AD_TABLE"
-for row in "${SEED_AD_ACCOUNTS[@]}"; do
-  IFS='|' read -r account_hash days rotation_status <<<"$row"
+# --- Seed IAM accounts ---------------------------------------------------------
+step "Seeding IAM accounts into $IAM_TABLE"
+for row in "${SEED_IAM_ACCOUNTS[@]}"; do
+  IFS='|' read -r account_hash days status <<<"$row"
   next_rotation="$(_date_in_days "$days")"
 
   # NextRotationDate is OwnerIndex's RANGE key — same trap as ExpiryDate above.
-  aws dynamodb put-item --table-name "$AD_TABLE" --region "$REGION" --item "$(cat <<EOF
+  aws dynamodb put-item --table-name "$IAM_TABLE" --region "$REGION" --item "$(cat <<EOF
 {
   "AccountIdHash":    {"S": "$account_hash"},
   "OwnerId":          {"S": "$USER_SUB"},
   "NextRotationDate": {"S": "$next_rotation"},
-  "RotationStatus":   {"S": "$rotation_status"},
+  "Status":           {"S": "$status"},
   "Source":           {"S": "seed.sh"}
 }
 EOF
 )"
-  pass "$account_hash  (next rotation $next_rotation, $rotation_status)"
+  pass "$account_hash  (next rotation $next_rotation, $status)"
 done
 
 # --- Seed audit events --------------------------------------------------------
@@ -182,7 +182,7 @@ done
 # sub — so seed against the sub, or the tab has nothing to show.
 step "Seeding audit events into $AUDIT_TABLE"
 AUDIT_EVENTS=(
-  "DISCOVERY_COMPLETED|SUCCESS|discovered 5 certificates, 3 AD accounts"
+  "DISCOVERY_COMPLETED|SUCCESS|discovered 5 certificates, 3 IAM accounts"
   "EXPIRY_EVALUATED|SUCCESS|1 certificate within 7 days, 2 within 30"
   "NOTIFICATION_SENT|SUCCESS|high-severity alert published to SNS"
 )
@@ -215,15 +215,15 @@ done
 
 cat <<EOF
 
-$(printf '\033[32mSeeded %s certificates, %s AD accounts, %s audit events.\033[0m' \
-  "${#SEED_CERTS[@]}" "${#SEED_AD_ACCOUNTS[@]}" "${#AUDIT_EVENTS[@]}")
+$(printf '\033[32mSeeded %s certificates, %s IAM accounts, %s audit events.\033[0m' \
+  "${#SEED_CERTS[@]}" "${#SEED_IAM_ACCOUNTS[@]}" "${#AUDIT_EVENTS[@]}")
 
 Open $APP_URL and sign in as $TARGET_EMAIL:
 
   Certificates   5 rows, colour-coded red / amber / green by days remaining.
                  "Renew" starts the renewal state machine and writes an audit
                  event, so it also exercises the write path.
-  AD Accounts    3 rows. "Rotate" starts the rotation state machine.
+  IAM Accounts   3 rows. "Rotate" starts the rotation state machine.
   Audit          search for  $USER_SUB  to see the seeded events, plus anything
                  your own Renew/Rotate clicks appended.
 

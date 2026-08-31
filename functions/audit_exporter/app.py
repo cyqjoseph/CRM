@@ -17,7 +17,7 @@ CERT_ARN_PREFIXES = ("arn:aws:acm", "arn:aws:iam", "arn:aws:secretsmanager")
 def _entity_type(entity_id):
     if entity_id.startswith(CERT_ARN_PREFIXES):
         return "cert"
-    return "ad-account"
+    return "iam-account"
 
 
 def _image_to_plain(image):

@@ -1,0 +1,17 @@
+# STUB — non-functional. See ansible/README.md.
+#
+# Intent: enumerate on-prem AD user accounts and their password-last-set
+# date, so rotate-ad-passwords and report-to-dynamodb have something to act
+# on. Mirrors functions/discovery_iam/app.py's AWS-side equivalent.
+---
+- name: TODO — query AD for user accounts (e.g. community.windows.win_domain_user info, or ldap_search)
+  debug:
+    msg: "STUB: not implemented — see ansible/README.md"
+
+- name: TODO — compute password age per account and flag warning/critical bands
+  debug:
+    msg: "STUB: not implemented"
+
+- name: TODO — hand discovered accounts to report-to-dynamodb
+  debug:
+    msg: "STUB: not implemented"

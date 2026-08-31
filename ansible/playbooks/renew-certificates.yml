@@ -1,0 +1,8 @@
+# STUB — non-functional. See ansible/README.md.
+---
+- name: Renew a flagged on-prem ADCS certificate
+  hosts: adcs
+  gather_facts: false
+  roles:
+    - renew-certificates
+    - report-to-dynamodb

@@ -1,0 +1,33 @@
+{
+  "_comment": [
+    "TEMPLATE ONLY. Not deployed by template.yaml, not referenced by deploy.sh",
+    "or destroy.sh, and not attached to any real IAM entity anywhere in this",
+    "repository. See ansible/README.md.",
+    "",
+    "This shows the minimum DynamoDB permissions an on-prem-facing credential",
+    "would need IF a future implementer chose to call DynamoDB directly from",
+    "the report-to-dynamodb Ansible role instead of going through the",
+    "deployed POST /sync/on-prem-data API (functions/sync_on_prem/app.py),",
+    "which is the recommended path since it keeps on-prem credentials out of",
+    "IAM entirely.",
+    "",
+    "Any real role created from this template MUST still follow every rule in",
+    "CLAUDE.md: name prefix app-d9fae51c-1929cc69-, the mandated",
+    "PermissionsBoundary, and region ap-southeast-1."
+  ],
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "OnPremSyncWriteOnly",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:ap-southeast-1:*:table/app-d9fae51c-1929cc69-cert-inventory",
+        "arn:aws:dynamodb:ap-southeast-1:*:table/app-d9fae51c-1929cc69-iam-accounts"
+      ]
+    }
+  ]
+}

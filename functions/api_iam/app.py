@@ -1,4 +1,4 @@
-"""api-ad-fn: GET /ad-accounts, GET /ad-accounts/{accountId}, POST /ad-accounts/{accountId}/rotate."""
+"""api-iam-fn: GET /iam/accounts, GET /iam/accounts/{accountId}, POST /iam/accounts/{accountId}/rotate."""
 import os
 
 import boto3
@@ -12,7 +12,7 @@ from crm_common import (
     put_audit_event,
 )
 
-AD_TABLE_NAME = os.environ["AD_TABLE_NAME"]
+IAM_TABLE_NAME = os.environ["IAM_TABLE_NAME"]
 ROTATION_STATE_MACHINE_ARN = os.environ["ROTATION_STATE_MACHINE_ARN"]
 
 
@@ -35,7 +35,7 @@ def _list_accounts(table, claims, query_params):
     )
     items = response.get("Items", [])
     if query_params.get("status"):
-        items = [i for i in items if i.get("RotationStatus") == query_params["status"]]
+        items = [i for i in items if i.get("Status") == query_params["status"]]
     return api_response(200, {"items": items})
 
 
@@ -79,7 +79,7 @@ def _rotate_account(table, claims, account_id):
 @guard_api_handler
 def handler(event, context):
     claims = get_claims(event)
-    table = boto3.resource("dynamodb").Table(AD_TABLE_NAME)
+    table = boto3.resource("dynamodb").Table(IAM_TABLE_NAME)
 
     method = event.get("httpMethod")
     path_params = event.get("pathParameters") or {}

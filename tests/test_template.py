@@ -40,23 +40,33 @@ REQUIRED_ROUTES = {
     ("/certs", "get"),
     ("/certs/{certId}", "get"),
     ("/certs/{certId}/renew", "post"),
-    ("/ad-accounts", "get"),
-    ("/ad-accounts/{accountId}", "get"),
-    ("/ad-accounts/{accountId}/rotate", "post"),
+    ("/iam/accounts", "get"),
+    ("/iam/accounts/{accountId}", "get"),
+    ("/iam/accounts/{accountId}/rotate", "post"),
+    ("/sync/on-prem-data", "post"),
     ("/executions/{executionId}", "get"),
     ("/audit", "get"),
 }
 
 # Actions that AWS's IAM Service Authorization Reference documents as NOT
 # supporting resource-level permissions at all — a wildcard Resource is the
-# only valid value for these, not a scoping gap.
+# only valid value for these, not a scoping gap. The 5 CloudWatch Logs actions
+# are here for a different reason: Lambda's own execution environment calls
+# them (to create its log group/stream) before that log group exists, so even
+# a correctly-scoped ARN would deny the very first invocation.
 MANDATORY_WILDCARD_ACTIONS = {
     "acm:ListCertificates",
     "acm:DescribeCertificate",
     "secretsmanager:ListSecrets",
     "secretsmanager:DescribeSecret",
     "iam:ListServerCertificates",
-    "ecr:GetAuthorizationToken",
+    "iam:ListUsers",
+    "iam:ListAccessKeys",
+    "logs:CreateLogGroup",
+    "logs:CreateLogStream",
+    "logs:PutLogEvents",
+    "logs:DescribeLogGroups",
+    "logs:DescribeLogStreams",
 }
 
 
@@ -119,19 +129,22 @@ def test_no_wildcard_resource_outside_documented_exceptions():
 
 
 def test_pass_role_statements_scope_to_named_role_arns_not_wildcard():
-    pass_role_seen = False
+    """No iam:PassRole grant should ever target a wildcard resource.
+
+    The current architecture (ECS/Fargate removed) has no legitimate
+    iam:PassRole use case at all, so zero statements is expected and fine —
+    this only guards against one being reintroduced with Resource: "*".
+    """
     for logical_id, statement in _iter_statements():
         actions = statement["Action"]
         actions = [actions] if isinstance(actions, str) else actions
         if "iam:PassRole" not in actions:
             continue
-        pass_role_seen = True
         resource = statement["Resource"]
         resources = [resource] if isinstance(resource, (str, dict)) else resource
         assert resources != "*"
         for r in resources:
             assert r != "*", f"{logical_id} grants iam:PassRole on a wildcard resource"
-    assert pass_role_seen, "expected at least one iam:PassRole statement in the template"
 
 
 def test_resource_names_use_the_mandated_prefix():

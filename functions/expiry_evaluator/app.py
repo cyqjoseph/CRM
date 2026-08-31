@@ -13,7 +13,7 @@ import boto3
 from crm_common import put_audit_event
 
 CERT_TABLE_NAME = os.environ["CERT_TABLE_NAME"]
-AD_TABLE_NAME = os.environ["AD_TABLE_NAME"]
+IAM_TABLE_NAME = os.environ["IAM_TABLE_NAME"]
 JIRA_QUEUE_URL = os.environ["JIRA_QUEUE_URL"]
 SNS_TOPIC_LOW = os.environ["SNS_TOPIC_LOW"]
 SNS_TOPIC_MEDIUM = os.environ["SNS_TOPIC_MEDIUM"]
@@ -86,15 +86,15 @@ def handler(event, context):
     for item in cert_response.get("Items", []):
         matches.append(("cert", item["CertId"], item.get("ExpiryDate")))
 
-    ad_table = dynamodb.Table(AD_TABLE_NAME)
-    ad_response = ad_table.query(
-        IndexName="RotationIndex",
+    iam_table = dynamodb.Table(IAM_TABLE_NAME)
+    iam_response = iam_table.query(
+        IndexName="StatusIndex",
         KeyConditionExpression="#s = :status AND #e <= :cutoff",
-        ExpressionAttributeNames={"#s": "RotationStatus", "#e": "NextRotationDate"},
-        ExpressionAttributeValues={":status": "ACTIVE", ":cutoff": cutoff},
+        ExpressionAttributeNames={"#s": "Status", "#e": "NextRotationDate"},
+        ExpressionAttributeValues={":status": "active", ":cutoff": cutoff},
     )
-    for item in ad_response.get("Items", []):
-        matches.append(("ad-account", item["AccountIdHash"], item.get("NextRotationDate")))
+    for item in iam_response.get("Items", []):
+        matches.append(("iam-account", item["AccountIdHash"], item.get("NextRotationDate")))
 
     now = datetime.now(timezone.utc)
     alerted = 0

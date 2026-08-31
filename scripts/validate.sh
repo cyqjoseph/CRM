@@ -104,7 +104,7 @@ pass "got an ID token"
 step "6. Authenticated API calls"
 # The empty-list case is itself a meaningful result: it proves the authorizer
 # accepted the token, the Lambda ran, and the DynamoDB query succeeded.
-for path in /certs /ad-accounts; do
+for path in /certs /iam/accounts; do
   BODY="$(curl -s -w '\n%{http_code}' "$API_URL$path" -H "Authorization: $ID_TOKEN")"
   STATUS="$(printf '%s' "$BODY" | tail -n1)"
   JSON="$(printf '%s' "$BODY" | sed '$d')"
