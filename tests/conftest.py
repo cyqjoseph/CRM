@@ -21,6 +21,15 @@ os.environ.setdefault("JIRA_TOKEN_SECRET_ARN", "arn:aws:secretsmanager:ap-southe
 os.environ.setdefault("JIRA_BASE_URL", "https://example.atlassian.net")
 os.environ.setdefault("RENEWAL_STATE_MACHINE_ARN", "arn:aws:states:ap-southeast-1:123456789012:stateMachine:test-renewal-sfn")
 os.environ.setdefault("ROTATION_STATE_MACHINE_ARN", "arn:aws:states:ap-southeast-1:123456789012:stateMachine:test-rotation-sfn")
+os.environ.setdefault("PASSWORD_RESET_TABLE_NAME", "test-password-reset-requests")
+os.environ.setdefault("PASSWORD_RESET_STATE_MACHINE_ARN", "arn:aws:states:ap-southeast-1:123456789012:stateMachine:test-password-reset-sfn")
+os.environ.setdefault(
+    "PASSWORD_RESET_CREDENTIALS_SECRET_ARN",
+    "arn:aws:secretsmanager:ap-southeast-1:123456789012:secret:test-password-reset-credentials",
+)
+os.environ.setdefault(
+    "PASSWORD_RESET_NOTIFICATIONS_TOPIC_ARN", "arn:aws:sns:ap-southeast-1:123456789012:test-password-reset-notifications"
+)
 
 
 def load_module(name, relative_path):

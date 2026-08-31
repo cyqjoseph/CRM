@@ -9,6 +9,8 @@
   let idToken = null;
   let pendingSignUpEmail = null;
   let mode = "signIn"; // signIn | signUp | confirm
+  let isAdmin = false;
+  let modalAccountId = null;
 
   const el = (id) => document.getElementById(id);
   const show = (id) => el(id).classList.remove("hidden");
@@ -95,6 +97,9 @@
       onSuccess: (session) => {
         currentUser = user;
         idToken = session.getIdToken().getJwtToken();
+        const groups = session.getIdToken().decodePayload()["cognito:groups"] || [];
+        isAdmin = Array.isArray(groups) ? groups.includes("admins") : String(groups).split(",").includes("admins");
+        el("passwordResetsTab").classList.toggle("hidden", !isAdmin);
         el("userEmail").textContent = email;
         show("userBar");
         hide("authView");
@@ -108,6 +113,8 @@
   el("signOutLink").addEventListener("click", () => {
     if (currentUser) currentUser.signOut();
     idToken = null;
+    isAdmin = false;
+    el("passwordResetsTab").classList.add("hidden");
     hide("appView");
     hide("userBar");
     show("authView");
@@ -131,11 +138,12 @@
     btn.addEventListener("click", () => {
       document.querySelectorAll(".tab").forEach((b) => b.classList.remove("active"));
       btn.classList.add("active");
-      ["certs", "iam", "audit"].forEach((t) => {
+      ["certs", "iam", "audit", "password-resets"].forEach((t) => {
         el(`tab-${t}`).classList.toggle("hidden", t !== btn.dataset.tab);
       });
       if (btn.dataset.tab === "certs") loadCerts();
       if (btn.dataset.tab === "iam") loadIamAccounts();
+      if (btn.dataset.tab === "password-resets") loadPasswordResets();
     });
   });
 
@@ -196,13 +204,19 @@
             <td>${a.AccountIdHash}</td>
             <td>${a.NextRotationDate || ""}</td>
             <td>${a.Status || ""}</td>
-            <td><button class="action" data-account="${a.AccountIdHash}">Rotate</button></td>
+            <td>
+              <button class="action" data-account="${a.AccountIdHash}">Rotate</button>
+              <button class="action" data-details="${a.AccountIdHash}">Details</button>
+            </td>
           </tr>`
         )
         .join("");
       el("iamBody").innerHTML = rows || `<tr><td colspan="5">No IAM accounts found.</td></tr>`;
       el("iamBody").querySelectorAll("button[data-account]").forEach((b) => {
         b.addEventListener("click", () => rotateAccount(b.dataset.account, b));
+      });
+      el("iamBody").querySelectorAll("button[data-details]").forEach((b) => {
+        b.addEventListener("click", () => openAccountModal(b.dataset.details));
       });
     } catch (err) {
       setError("iamError", err.message);
@@ -219,6 +233,103 @@
       button.disabled = false;
     }
   }
+
+  // --- Account detail modal + password reset requests ---
+
+  function openAccountModal(accountId) {
+    modalAccountId = accountId;
+    el("accountModalBody").innerHTML = `<p>Account: <strong>${accountId}</strong></p>`;
+    setError("resetRequestError", null);
+    setError("resetRequestStatus", null);
+    el("resetReason").value = "";
+    el("requestResetBtn").disabled = false;
+    el("requestResetBtn").textContent = "Request Password Reset";
+    show("accountModal");
+  }
+
+  el("accountModalClose").addEventListener("click", () => hide("accountModal"));
+  el("accountModal").addEventListener("click", (e) => {
+    if (e.target.id === "accountModal") hide("accountModal");
+  });
+
+  el("requestResetBtn").addEventListener("click", async () => {
+    if (!modalAccountId) return;
+    setError("resetRequestError", null);
+    el("requestResetBtn").disabled = true;
+    try {
+      const reason = el("resetReason").value.trim();
+      await apiFetch("/password-resets", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ accountId: modalAccountId, reason }),
+      });
+      el("requestResetBtn").textContent = "Reset Requested";
+      setError(
+        "resetRequestStatus",
+        "Reset Requested — pending admin review. Estimated review time: within 1 business day."
+      );
+    } catch (err) {
+      setError("resetRequestError", err.message);
+      el("requestResetBtn").disabled = false;
+    }
+  });
+
+  // --- Password reset admin dashboard ---
+
+  async function loadPasswordResets() {
+    setError("passwordResetsError", null);
+    try {
+      const status = el("resetStatusFilter").value;
+      const from = el("resetFromDate").value;
+      const to = el("resetToDate").value;
+      const params = new URLSearchParams();
+      if (status) params.set("status", status);
+      if (from) params.set("from", from);
+      if (to) params.set("to", to);
+      const query = params.toString();
+      const data = await apiFetch(`/password-resets${query ? `?${query}` : ""}`, { method: "GET" });
+      const rows = (data.items || [])
+        .map((r) => {
+          const actions =
+            r.Status === "pending"
+              ? `<button class="action" data-approve="${r.RequestId}">Approve</button>
+                 <button class="action" data-reject="${r.RequestId}">Reject</button>`
+              : "";
+          return `<tr>
+            <td>${r.RequestId}</td>
+            <td>${r.AccountId}</td>
+            <td>${r.RequestedBy}</td>
+            <td>${r.Reason || ""}</td>
+            <td>${r.Timestamp}</td>
+            <td>${r.Status}</td>
+            <td>${actions}</td>
+          </tr>`;
+        })
+        .join("");
+      el("passwordResetsBody").innerHTML = rows || `<tr><td colspan="7">No password reset requests found.</td></tr>`;
+      el("passwordResetsBody").querySelectorAll("button[data-approve]").forEach((b) => {
+        b.addEventListener("click", () => decidePasswordReset(b.dataset.approve, "approve", b));
+      });
+      el("passwordResetsBody").querySelectorAll("button[data-reject]").forEach((b) => {
+        b.addEventListener("click", () => decidePasswordReset(b.dataset.reject, "reject", b));
+      });
+    } catch (err) {
+      setError("passwordResetsError", err.message);
+    }
+  }
+
+  async function decidePasswordReset(requestId, action, button) {
+    button.disabled = true;
+    try {
+      await apiFetch(`/password-resets/${encodeURIComponent(requestId)}/${action}`, { method: "POST" });
+      loadPasswordResets();
+    } catch (err) {
+      setError("passwordResetsError", err.message);
+      button.disabled = false;
+    }
+  }
+
+  el("resetFilterSearch").addEventListener("click", loadPasswordResets);
 
   // --- Audit ---
 

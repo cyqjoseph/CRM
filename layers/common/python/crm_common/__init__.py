@@ -49,6 +49,10 @@ def put_audit_event(entity_id, event_type, actor, outcome, detail=None, table_na
     )
 
 
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
 def hash_identifier(value):
     """One-way hash for account identifiers; never store plaintext identifiers."""
     return hashlib.sha256(value.encode("utf-8")).hexdigest()

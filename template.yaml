@@ -172,6 +172,37 @@ Resources:
       StreamSpecification:
         StreamViewType: NEW_IMAGE
 
+  # Append-only-in-spirit request log for the password reset approval queue.
+  # Each RequestId gets exactly one row, mutated in place (pending -> approved/
+  # rejected -> completed) — the actual append-only audit trail for these
+  # actions lives in AuditHotTable, written on every state transition.
+  PasswordResetRequestsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: app-d9fae51c-1929cc69-password-reset-requests
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: RequestId
+          AttributeType: S
+        - AttributeName: Timestamp
+          AttributeType: S
+        - AttributeName: Status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: RequestId
+          KeyType: HASH
+        - AttributeName: Timestamp
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: Status
+              KeyType: HASH
+            - AttributeName: Timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
   # ---------------------------------------------------------------------------
   # S3: audit archive + self-service UI static site
   # ---------------------------------------------------------------------------
@@ -389,6 +420,11 @@ Resources:
     Properties:
       TopicName: app-d9fae51c-1929cc69-completions
 
+  PasswordResetNotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: app-d9fae51c-1929cc69-password-reset-notifications
+
   OpsAlarmsTopic:
     Type: AWS::SNS::Topic
     Properties:
@@ -418,6 +454,16 @@ Resources:
       Name: app-d9fae51c-1929cc69-jira-token
       Description: Jira Cloud API token used by the jira-notifier function. Replace the placeholder after deploy.
       SecretString: '{"token":"REPLACE_ME"}'
+
+  # Holds only SHA-256 hashes + metadata of temporary reset passwords, keyed by
+  # RequestId — never the plaintext value itself (C-02). See
+  # functions/password_reset_executor/app.py and README.md's Deviations section.
+  PasswordResetCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: app-d9fae51c-1929cc69-password-reset-credentials
+      Description: Hashes + metadata of generated temporary reset passwords, keyed by RequestId. Never contains a plaintext password.
+      SecretString: "{}"
 
   # Registry of the simulated EC2 test instances + the (simulated) certificate
   # identifiers correlated to them. This has a real dependency on the three
@@ -864,6 +910,128 @@ Resources:
             Path: /executions/{executionId}
             Method: get
 
+  ApiPasswordResetsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: app-d9fae51c-1929cc69-api-password-resets-fn
+      CodeUri: functions/api_password_resets/
+      Handler: app.handler
+      Environment:
+        Variables:
+          PASSWORD_RESET_TABLE_NAME: !Ref PasswordResetRequestsTable
+          IAM_TABLE_NAME: !Ref IamAccountsTable
+          AUDIT_TABLE_NAME: !Ref AuditHotTable
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref PasswordResetRequestsTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref PasswordResetRequestsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref IamAccountsTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref AuditHotTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                - logs:DescribeLogGroups
+                - logs:DescribeLogStreams
+              Resource: "*"
+      Events:
+        CreatePasswordReset:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CrmApi
+            Path: /password-resets
+            Method: post
+        ListPasswordResets:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CrmApi
+            Path: /password-resets
+            Method: get
+
+  PasswordResetApproverFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: app-d9fae51c-1929cc69-password-reset-approver-fn
+      CodeUri: functions/password_reset_approver/
+      Handler: app.handler
+      Environment:
+        Variables:
+          PASSWORD_RESET_TABLE_NAME: !Ref PasswordResetRequestsTable
+          PASSWORD_RESET_STATE_MACHINE_ARN: !Ref PasswordResetSfn
+          PASSWORD_RESET_NOTIFICATIONS_TOPIC_ARN: !Ref PasswordResetNotificationsTopic
+          AUDIT_TABLE_NAME: !Ref AuditHotTable
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref PasswordResetRequestsTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref PasswordResetRequestsTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref AuditHotTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt PasswordResetNotificationsTopic.TopicName
+        - Statement:
+            - Effect: Allow
+              Action: states:StartExecution
+              Resource: !Ref PasswordResetSfn
+        - Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                - logs:DescribeLogGroups
+                - logs:DescribeLogStreams
+              Resource: "*"
+      Events:
+        ApprovePasswordReset:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CrmApi
+            Path: /password-resets/{requestId}/approve
+            Method: post
+        RejectPasswordReset:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CrmApi
+            Path: /password-resets/{requestId}/reject
+            Method: post
+
+  # Invoked only by PasswordResetSfn, never directly over the API — generates
+  # and SHA-256 hashes a temporary password and stores just the hash+metadata
+  # in PasswordResetCredentialsSecret. The plaintext value never leaves this
+  # function's memory (C-02); delivering it by email is out of scope since SES
+  # is not an allowed service here. See README.md's Deviations section.
+  PasswordResetExecutorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: app-d9fae51c-1929cc69-password-reset-executor-fn
+      CodeUri: functions/password_reset_executor/
+      Handler: app.handler
+      Environment:
+        Variables:
+          PASSWORD_RESET_CREDENTIALS_SECRET_ARN: !Ref PasswordResetCredentialsSecret
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+                - secretsmanager:PutSecretValue
+              Resource: !Ref PasswordResetCredentialsSecret
+        - Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                - logs:DescribeLogGroups
+                - logs:DescribeLogStreams
+              Resource: "*"
+
   # Stub proxy for future on-prem (Ansible-driven) inventory sync. Passes the
   # request body straight through to DynamoDB with no validation — see
   # ansible/README.md and the TODO in functions/sync_on_prem/app.py. Not
@@ -1055,6 +1223,53 @@ Resources:
       Tracing:
         Enabled: true
 
+  PasswordResetSfnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: app-d9fae51c-1929cc69-password-reset-sfn-role
+      PermissionsBoundary: arn:aws:iam::544635841962:policy/brd-architect-deploy-boundary
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub "states.${AWS::Region}.amazonaws.com"
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: password-reset-sfn-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt PasswordResetExecutorFunction.Arn
+              - Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt PasswordResetRequestsTable.Arn
+                  - !GetAtt IamAccountsTable.Arn
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt AuditHotTable.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref PasswordResetNotificationsTopic
+
+  PasswordResetSfn:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: app-d9fae51c-1929cc69-password-reset-sfn
+      DefinitionUri: statemachines/password_reset.asl.json
+      DefinitionSubstitutions:
+        PasswordResetExecutorFunctionArn: !GetAtt PasswordResetExecutorFunction.Arn
+        PasswordResetTableName: !Ref PasswordResetRequestsTable
+        IamTableName: !Ref IamAccountsTable
+        AuditTableName: !Ref AuditHotTable
+        NotificationsTopicArn: !Ref PasswordResetNotificationsTopic
+      Role: !GetAtt PasswordResetSfnRole.Arn
+      Tracing:
+        Enabled: true
+
   # ---------------------------------------------------------------------------
   # EventBridge schedules
   # ---------------------------------------------------------------------------
@@ -1171,6 +1386,23 @@ Resources:
       Dimensions:
         - Name: StateMachineArn
           Value: !Ref RotationSfn
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref OpsAlarmsTopic
+
+  PasswordResetSfnFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: app-d9fae51c-1929cc69-password-reset-sfn-failed
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref PasswordResetSfn
       Statistic: Sum
       Period: 300
       EvaluationPeriods: 1
@@ -1366,6 +1598,57 @@ Resources:
       AlarmActions:
         - !Ref OpsAlarmsTopic
 
+  LambdaErrorAlarmApiPasswordResets:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: app-d9fae51c-1929cc69-api-password-resets-fn-errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ApiPasswordResetsFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref OpsAlarmsTopic
+
+  LambdaErrorAlarmPasswordResetApprover:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: app-d9fae51c-1929cc69-password-reset-approver-fn-errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PasswordResetApproverFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref OpsAlarmsTopic
+
+  LambdaErrorAlarmPasswordResetExecutor:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: app-d9fae51c-1929cc69-password-reset-executor-fn-errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PasswordResetExecutorFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref OpsAlarmsTopic
+
   Dashboard:
     Type: AWS::CloudWatch::Dashboard
     Properties:
@@ -1391,7 +1674,10 @@ Resources:
                   ["AWS/Lambda", "Errors", "FunctionName", "${ApiIamFunction}"],
                   ["AWS/Lambda", "Errors", "FunctionName", "${ApiAuditFunction}"],
                   ["AWS/Lambda", "Errors", "FunctionName", "${SyncOnPremFunction}"],
-                  ["AWS/Lambda", "Errors", "FunctionName", "${AuditExporterFunction}"]
+                  ["AWS/Lambda", "Errors", "FunctionName", "${AuditExporterFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${ApiPasswordResetsFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${PasswordResetApproverFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${PasswordResetExecutorFunction}"]
                 ]
               }
             },
@@ -1405,7 +1691,8 @@ Resources:
                 "metrics": [
                   ["AWS/States", "ExecutionsFailed", "StateMachineArn", "${DiscoverySfn}"],
                   ["AWS/States", "ExecutionsFailed", "StateMachineArn", "${RenewalSfn}"],
-                  ["AWS/States", "ExecutionsFailed", "StateMachineArn", "${RotationSfn}"]
+                  ["AWS/States", "ExecutionsFailed", "StateMachineArn", "${RotationSfn}"],
+                  ["AWS/States", "ExecutionsFailed", "StateMachineArn", "${PasswordResetSfn}"]
                 ]
               }
             },
@@ -1445,6 +1732,8 @@ Outputs:
     Value: !Ref IamAccountsTable
   AuditHotTableName:
     Value: !Ref AuditHotTable
+  PasswordResetRequestsTableName:
+    Value: !Ref PasswordResetRequestsTable
   TestInstance1Id:
     Value: !Ref TestInstance1
   TestInstance2Id:

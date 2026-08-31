@@ -38,6 +38,27 @@ A small static single-page app (Cognito-authenticated) lets an owner view
 their certs/IAM accounts and trigger a renewal or rotation on demand; admins
 can additionally query the full audit trail for any entity.
 
+- **Password reset requests** — an owner can request a password reset for an
+  IAM/AD account from its detail modal in the UI, with an optional
+  reason/ticket reference. The request lands in an approval queue
+  (`app-d9fae51c-1929cc69-password-reset-requests`) rather than executing
+  immediately; an admin reviews it from the "Password Resets" tab and
+  approves or rejects it. Approval starts a Step Functions execution that
+  generates a temporary credential, hashes it, stores only the hash in
+  Secrets Manager, marks the source account's `RotationStatus` "completed",
+  and notifies the requester over SNS; rejection just notifies and closes the
+  request. Every step — request creation, approval/rejection, and completion
+  or failure — writes an event to `{env}-crm-audit-hot`.  A plaintext
+  password is never written to DynamoDB (policy C-02); see Deviations for why
+  it is generated, hashed, and then discarded rather than delivered.
+
+  The account detail modal also documents Cognito's built-in self-service
+  reset as an alternative — it is not wired up in this UI (there is no
+  Hosted UI domain deployed to link to), so the documentation text does not
+  fabricate a URL for it. This system only manages accounts that already
+  exist; there is no "create new user" flow — the UI directs the requester
+  to contact IT for that.
+
 ## Architecture
 
 - **Discovery**: `discovery-acm-fn` (ACM/IAM server certs/Secrets Manager,
@@ -68,6 +89,18 @@ can additionally query the full audit trail for any entity.
 - **UI**: a static HTML/CSS/JS site (Cognito SRP auth via
   `amazon-cognito-identity-js`, no build step) served from S3 through
   CloudFront with an Origin Access Control.
+- **Password reset requests**: `api-password-resets-fn` handles
+  `POST /password-resets` (owner creates a request) and
+  `GET /password-resets` (admin-only, filterable by status/date range).
+  `password-reset-approver-fn` handles the admin-only
+  `POST /password-resets/{requestId}/approve` and `.../reject`; approval
+  starts the `password-reset` state machine, which invokes
+  `password-reset-executor-fn` (generates and hashes a temporary credential,
+  storing only the hash in `PasswordResetCredentialsSecret`), then updates
+  the request and the source account's inventory row, writes the audit
+  event, and publishes an SNS notification to the requester. Rejection is
+  handled entirely inside the approver function — no state machine
+  execution — since there's no credential to generate.
 
 All infrastructure is defined in `template.yaml` (AWS SAM). `deploy.sh`
 builds and deploys the stack, creates 3 EC2 `t3.micro` test instances and
@@ -161,6 +194,23 @@ authoritative. Concretely:
   to the named table with no real validation — it exists only so the
   `ansible/roles/report-to-dynamodb` stub has a concrete target to call once
   it is implemented; nothing calls it today.
+- **Password reset execution replaces Fargate/LDAP with a plain Lambda**:
+  the original design for actually resetting an AD account's password
+  called for an ECS Fargate task speaking LDAP to an on-prem/managed AD
+  domain controller — infeasible here for the same reason as the on-prem AD
+  discovery deviation above (no Directory Service, no on-prem network path
+  from this sandbox account). `password-reset-executor-fn` is a plain Lambda
+  invoked by the `password-reset` state machine instead, following the same
+  NOTIFY-style substitution pattern as `rotation-iam-key-fn` above: it
+  generates a temporary credential and a SHA-256 hash of it, stores only the
+  hash (plus request metadata) in `PasswordResetCredentialsSecret`, and then
+  discards the plaintext value — it is never returned, logged, or persisted
+  anywhere, satisfying policy C-02. It is also never delivered to the
+  requester: SES is not in CLAUDE.md's allowed-services list, so there is no
+  permitted way to email it. The SNS notification on completion tells the
+  requester the reset happened, not what the new password is; delivering the
+  actual credential is left to whatever real, permitted channel a production
+  deployment would add (e.g. Amazon SES/Pinpoint, once granted).
 - **Owner scoping**: enforced in each API Lambda's application code by
   comparing the resource's `OwnerId` to the Cognito JWT's `sub` claim,
   rather than via IAM-level DynamoDB `LeadingKeys` conditions. This

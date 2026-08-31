@@ -46,6 +46,10 @@ REQUIRED_ROUTES = {
     ("/sync/on-prem-data", "post"),
     ("/executions/{executionId}", "get"),
     ("/audit", "get"),
+    ("/password-resets", "post"),
+    ("/password-resets", "get"),
+    ("/password-resets/{requestId}/approve", "post"),
+    ("/password-resets/{requestId}/reject", "post"),
 }
 
 # Actions that AWS's IAM Service Authorization Reference documents as NOT
@@ -96,7 +100,7 @@ def test_tracing_active_for_all_functions():
 
 def test_api_and_state_machines_have_tracing_enabled():
     assert RESOURCES["CrmApi"]["Properties"]["TracingEnabled"] is True
-    for name in ("DiscoverySfn", "RenewalSfn", "RotationSfn"):
+    for name in ("DiscoverySfn", "RenewalSfn", "RotationSfn", "PasswordResetSfn"):
         assert RESOURCES[name]["Properties"]["Tracing"]["Enabled"] is True
 
 

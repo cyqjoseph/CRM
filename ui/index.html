@@ -40,6 +40,7 @@
         <button class="tab active" data-tab="certs">Certificates</button>
         <button class="tab" data-tab="iam">IAM Accounts</button>
         <button class="tab" data-tab="audit">Audit</button>
+        <button class="tab hidden" data-tab="password-resets" id="passwordResetsTab">Password Resets</button>
       </div>
 
       <div id="tab-certs" class="card">
@@ -53,6 +54,10 @@
       </div>
 
       <div id="tab-iam" class="card hidden">
+        <div class="sub" style="margin-bottom:10px;">
+          This system manages the lifecycle of existing accounts only, discovered from AWS IAM.
+          To create a new user, contact IT.
+        </div>
         <div id="iamError" class="error hidden"></div>
         <table>
           <thead>
@@ -73,8 +78,50 @@
           <tbody id="auditBody"></tbody>
         </table>
       </div>
+
+      <div id="tab-password-resets" class="card hidden">
+        <div class="filters">
+          <select id="resetStatusFilter">
+            <option value="">All statuses</option>
+            <option value="pending">Pending</option>
+            <option value="approved">Approved</option>
+            <option value="rejected">Rejected</option>
+            <option value="completed">Completed</option>
+          </select>
+          <input id="resetFromDate" type="date" />
+          <input id="resetToDate" type="date" />
+          <button class="action" id="resetFilterSearch">Search</button>
+        </div>
+        <div id="passwordResetsError" class="error hidden" style="margin-top:10px;"></div>
+        <table>
+          <thead>
+            <tr><th>Request ID</th><th>Account</th><th>Requested by</th><th>Reason</th><th>Timestamp</th><th>Status</th><th></th></tr>
+          </thead>
+          <tbody id="passwordResetsBody"></tbody>
+        </table>
+      </div>
     </section>
   </main>
+
+  <div id="accountModal" class="modal-overlay hidden">
+    <div class="modal card">
+      <button class="modal-close" id="accountModalClose">&times;</button>
+      <h2>Account details</h2>
+      <div id="accountModalBody"></div>
+      <hr />
+      <div id="resetSection">
+        <div id="resetRequestStatus" class="msg hidden"></div>
+        <div id="resetRequestError" class="error hidden"></div>
+        <textarea id="resetReason" rows="3" placeholder="Reason / ticket reference (optional)"></textarea>
+        <button class="action" id="requestResetBtn">Request Password Reset</button>
+      </div>
+      <p class="sub" style="margin-top:14px;">
+        Alternatively, Cognito supports self-service password reset out of the box.
+        This prototype's UI does not expose that flow directly (no Hosted UI domain is
+        configured) — ask an administrator if you'd like it enabled.
+      </p>
+    </div>
+  </div>
 
   <script src="https://cdn.jsdelivr.net/npm/amazon-cognito-identity-js@6.3.12/dist/amazon-cognito-identity.min.js"></script>
   <script src="config.js"></script>

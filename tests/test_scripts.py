@@ -30,10 +30,11 @@ def _without_comments(script: str) -> str:
         line for line in script.splitlines() if not line.lstrip().startswith("#")
     )
 
-# The two AWS::SecretsManager::Secret names in template.yaml.
+# The AWS::SecretsManager::Secret names in template.yaml.
 SECRET_NAMES = (
     "app-d9fae51c-1929cc69-test-instance-registry",
     "app-d9fae51c-1929cc69-jira-token",
+    "app-d9fae51c-1929cc69-password-reset-credentials",
 )
 
 

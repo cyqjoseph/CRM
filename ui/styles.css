@@ -143,3 +143,60 @@ input {
 
 .error { color: var(--danger); font-size: 13px; margin-bottom: 10px; }
 .msg { color: var(--ok); font-size: 13px; margin-bottom: 10px; }
+
+textarea, select {
+  width: 100%;
+  padding: 8px 10px;
+  background: #0d141d;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text);
+  margin-bottom: 10px;
+  font-size: 14px;
+  font-family: inherit;
+}
+
+.filters {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 6px;
+}
+
+.filters select, .filters input { width: auto; margin-bottom: 0; }
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.modal {
+  position: relative;
+  max-width: 480px;
+  width: 90%;
+  max-height: 85vh;
+  overflow-y: auto;
+}
+
+.modal-close {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-size: 20px;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.modal hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 16px 0;
+}

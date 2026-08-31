@@ -14,6 +14,7 @@ OUTPUTS_FILE="outputs.json"
 SECRET_NAMES=(
   "app-d9fae51c-1929cc69-test-instance-registry"
   "app-d9fae51c-1929cc69-jira-token"
+  "app-d9fae51c-1929cc69-password-reset-credentials"
 )
 
 # --- Empty S3 buckets the stack owns; DeleteStack fails on non-empty buckets ---
