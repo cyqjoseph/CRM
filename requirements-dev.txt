@@ -3,3 +3,6 @@ PyYAML>=6.0
 # The function modules under test import boto3 at module scope, so the suite
 # fails at collection without it.
 boto3>=1.35
+# Validates template.yaml against AWS's resource schemas, so a bad property or
+# type is caught here rather than as a CREATE_FAILED mid-deploy.
+cfn-lint>=1.22

@@ -140,6 +140,35 @@ secret in `template.yaml`, that the purge runs before `sam deploy` and after
 than cancellations, and that neither script reaches for SAM's shared
 `aws-sam-cli-managed-default` bucket.
 
+`test_template_lint.py` runs `cfn-lint` over `template.yaml` (skipped if
+`cfn-lint` isn't installed), validating it against AWS's own resource schemas
+so a bad property or type fails here rather than as a `CREATE_FAILED` partway
+through a deploy. It complements rather than replaces the explicit checks in
+`test_template.py` — cfn-lint does not cover every service enum, and notably
+accepts an invalid Cognito `MfaConfiguration`.
+
+### YAML 1.1 boolean aliases
+
+`MfaConfiguration: OFF` was a deploy-blocking bug: bare `OFF` is a YAML 1.1
+boolean alias, so CloudFormation resolved it to `false` and sent Cognito the
+string `'false'`, failing with *"Value 'false' at 'mfaConfiguration' failed to
+satisfy constraint: Member must satisfy enum value set: [OPTIONAL, OFF, ON]"*.
+The value must be quoted. `test_no_unquoted_yaml_boolean_aliases_in_the_template`
+now scans the raw template for **any** unquoted `ON`/`OFF`/`YES`/`NO`/`Y`/`N`
+(and `TRUE`/`FALSE` in non-lowercase form), which catches this whole class —
+including a future DynamoDB `AttributeType: N`, which would break the same way.
+Lowercase `true`/`false` are unambiguous and allowed.
+
+### Editor configuration
+
+`.vscode/settings.json` declares CloudFormation's short-form intrinsic tags in
+`yaml.customTags`. Without it the YAML language server does not recognise
+`!Ref`/`!GetAtt`/`!Sub`/`!Join` and reports 162 "Unresolved tag" errors on a
+template that `cfn-lint` validates clean — phantom errors that bury real ones.
+The full intrinsic set is declared, not just the four tags currently used, so
+introducing `!If` or `!Select` later doesn't bring the noise back;
+`test_editor_config.py` fails if the template grows an undeclared tag.
+
 Run with:
 
 ```

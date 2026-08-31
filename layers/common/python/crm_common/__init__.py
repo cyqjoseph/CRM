@@ -11,6 +11,10 @@ import boto3
 
 AUDIT_TABLE_NAME = os.environ.get("AUDIT_TABLE_NAME", "")
 AUDIT_TTL_DAYS = int(os.environ.get("AUDIT_TTL_DAYS", "90"))
+# The API's Cors property only generates the OPTIONS preflight method. A Lambda
+# proxy integration's own responses carry exactly the headers the function sets,
+# so every real response needs this header too or the browser blocks the read.
+CORS_ALLOW_ORIGIN = os.environ.get("CORS_ALLOW_ORIGIN", "*")
 
 
 def dynamodb_resource():
@@ -57,7 +61,10 @@ class DecimalEncoder(json.JSONEncoder):
 def api_response(status_code, body):
     return {
         "statusCode": status_code,
-        "headers": {"Content-Type": "application/json"},
+        "headers": {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": CORS_ALLOW_ORIGIN,
+        },
         "body": json.dumps(body, cls=DecimalEncoder),
     }
 

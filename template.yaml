@@ -29,6 +29,11 @@ Globals:
     MemorySize: 256
     Tracing: Active
     PermissionsBoundary: arn:aws:iam::544635841962:policy/brd-architect-deploy-boundary
+    Environment:
+      Variables:
+        # Kept in step with CrmApi's Cors.AllowOrigin. SAM merges these Globals
+        # variables with each function's own Environment.Variables.
+        CORS_ALLOW_ORIGIN: "*"
     Layers:
       - !Ref CommonLayer
 
@@ -259,6 +264,10 @@ Resources:
       ExplicitAuthFlows:
         - ALLOW_USER_SRP_AUTH
         - ALLOW_REFRESH_TOKEN_AUTH
+        # Lets scripts/validate.sh obtain an ID token without implementing SRP.
+        # This flow requires AWS credentials (cognito-idp:AdminInitiateAuth), so
+        # it is not reachable from the browser — ui/app.js still uses SRP.
+        - ALLOW_ADMIN_USER_PASSWORD_AUTH
       PreventUserExistenceErrors: ENABLED
 
   UserPoolOwnersGroup:
@@ -282,11 +291,53 @@ Resources:
       Name: app-d9fae51c-1929cc69-api
       StageName: prod
       TracingEnabled: true
+      # The UI is served from CloudFront and calls this API on a different host,
+      # sending `Authorization: <idToken>`. That custom header makes every request
+      # non-simple, so the browser preflights with OPTIONS. Without Cors, SAM
+      # generates no OPTIONS method and API Gateway answers 403 "Missing
+      # Authentication Token" with no CORS headers.
+      # AllowOrigin is '*' deliberately: the CloudFront domain is AWS-generated,
+      # so pinning it would make this API depend on the distribution and serialise
+      # every deploy behind a 5-10 minute CloudFront rollout. CORS is not the
+      # security boundary here — the Cognito authorizer below is — and no cookies
+      # or credentialed requests are used, so '*' is safe for this prototype.
+      Cors:
+        AllowOrigin: "'*'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowMethods: "'GET,POST,OPTIONS'"
       Auth:
         DefaultAuthorizer: CognitoAuthorizer
+        # Must stay False. SAM defaults this to True, which attaches the Cognito
+        # authorizer to the generated OPTIONS method — but a browser never sends
+        # Authorization on a preflight, so it 401s and CORS fails anyway.
+        AddDefaultAuthorizerToCorsPreflight: false
         Authorizers:
           CognitoAuthorizer:
             UserPoolArn: !GetAtt UserPool.Arn
+
+  # API-Gateway-generated responses (an authorizer 401, a throttle 429, a 500)
+  # never reach a Lambda, so they carry only the headers the matching
+  # GatewayResponse defines. Without these, an expired token surfaces in the
+  # browser as an opaque CORS error instead of a readable 401.
+  ApiDefault4xxResponse:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref CrmApi
+      ResponseType: DEFAULT_4XX
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+        gatewayresponse.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+
+  ApiDefault5xxResponse:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref CrmApi
+      ResponseType: DEFAULT_5XX
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+        gatewayresponse.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
 
   # ---------------------------------------------------------------------------
   # SNS topics + SQS queues
