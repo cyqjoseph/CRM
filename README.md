@@ -75,6 +75,35 @@ All infrastructure is in `template.yaml` (AWS SAM). Shared Lambda code lives in
 repo root. It also invokes both discovery Lambdas once so the tables have data
 immediately instead of waiting for the daily schedule.
 
+### Generating demo data
+
+```bash
+./scripts/seed-demo-data.sh                            # 40 certs, 15 accounts, 30 audit events
+./scripts/seed-demo-data.sh --certs 200 --accounts 50  # more of it
+./scripts/seed-demo-data.sh --clean                    # remove it again
+SEED_OWNER_ID=<your-cognito-sub> ./scripts/seed-demo-data.sh
+```
+
+`deploy.sh` runs this automatically; override the volume with `SEED_CERTS`,
+`SEED_ACCOUNTS`, `SEED_AUDIT_EVENTS`, or skip it with `SEED_DEMO_DATA=false`.
+
+Rows are generated to exercise the UI rather than merely populate it: expiry
+dates are spread so every colour band is represented, ~1 in 6 certificates
+carries a non-`ISSUED` status so the `ExpiryIndex` filter has something to
+exclude, and ~1 in 4 accounts is `warning`/`critical`. Every id starts with
+`demo-`, and `--clean` deletes exactly those ids, so it can never remove a
+genuinely discovered resource. Generation is deterministic, so a re-run upserts
+the same rows rather than duplicating them.
+
+`scripts/gen_demo_data.py` builds the `batch-write-item` payloads and
+`seed-demo-data.sh` applies them through the AWS CLI. The split is deliberate:
+the generator needs only the standard library (the build host has `python3` and
+`aws` but not necessarily an importable `boto3`), and the write happens under
+whatever role invoked the CLI — which matters, because a human IAM user in this
+account is not granted `dynamodb:PutItem`, so seeding from a laptop can fail with
+`AccessDenied` while the identical call from `deploy.sh` succeeds. If that
+happens, run `./deploy.sh`.
+
 `validate.sh` exercises exactly what the browser does — CloudFront → Cognito
 sign-in → ID token → API Gateway authorizer → Lambda → DynamoDB — plus the CORS
 preflight, the unauthenticated 401, owner scoping, and a full renew (start, poll
@@ -143,7 +172,8 @@ Both index the same `OwnerIndex` GSI, so a perfectly healthy discovery run write
 rows that belong to no human login and appear in **nobody's** dashboard.
 
 `deploy.sh` therefore seeds demo rows against `SEED_OWNER_ID` (override it with
-your own Cognito `sub`). Reconciling the two meanings properly — mapping a
+your own Cognito `sub` — find it in any `api-certs-fn` log line's `ownerId`
+field after signing in once). Reconciling the two meanings properly — mapping a
 discovered resource to an owning user — is left open.
 
 Two traps make hand-seeding error-prone: `ExpiryDate` and `NextRotationDate` are
@@ -233,7 +263,7 @@ functions/               one directory per Lambda
 layers/common/           shared crm_common helpers
 statemachines/           Step Functions ASL definitions
 ui/                      static SPA (no build step)
-scripts/                 validate.sh + stack-output resolution
+scripts/                 validate.sh, demo-data seeding, stack-output resolution
 tests/                   pytest suite
 spec/ docs/ design/      platform inputs — reference only, never deployed
 ```

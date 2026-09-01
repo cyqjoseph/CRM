@@ -114,83 +114,25 @@ aws lambda invoke --function-name app-d9fae51c-1929cc69-discovery-acm-fn \
 # from an IAM path or a resource tag, while GET /certs and GET /iam/accounts
 # query OwnerIndex with the caller's Cognito `sub`. So genuinely discovered rows
 # belong to no human login and appear in nobody's UI. These rows are written
-# against a known sub so the dashboard has something to show and every control
-# (Renew, Rotate, Details, Request Password Reset) can be exercised end to end.
+# against a known sub so the dashboard has data and every control (Renew, Rotate,
+# Details, Request Password Reset) can be exercised end to end.
 #
-# Override with SEED_OWNER_ID=<your-cognito-sub> ./deploy.sh to target a
-# different login; find yours in the Cognito console, or in any api-certs-fn log
-# line's `ownerId` field after signing in once.
+# Override the target login and the volume without editing this file:
+#   SEED_OWNER_ID=<your-cognito-sub> SEED_CERTS=200 ./deploy.sh
 #
-# Field names matter and are easy to get wrong:
-#   - ExpiryDate / NextRotationDate are OwnerIndex's RANGE key on their table.
-#     DynamoDB accepts a row without one and then silently omits it from the
-#     index, so GET /certs would never return it.
-#   - The UI renders `Status` (not `RotationStatus`) and `UserName` on the IAM
-#     tab, and rotation.asl.json writes back to `Status`.
-# Dates are computed relative to now, not hardcoded — a fixed date silently ages
-# into the past and makes every row render as long expired.
-SEED_OWNER_ID="${SEED_OWNER_ID:-d9ca551c-d0a1-7011-1c4f-99a48c8d917f}"
+# Seeding must never abort an otherwise-successful deploy — every id starts with
+# `demo-` and every write is an idempotent upsert, so a retry is always safe.
+SEED_CERTS="${SEED_CERTS:-40}"
+SEED_ACCOUNTS="${SEED_ACCOUNTS:-15}"
+SEED_AUDIT_EVENTS="${SEED_AUDIT_EVENTS:-30}"
 
-CERT_TABLE="$(jq -r '.[] | select(.OutputKey=="CertInventoryTableName") | .OutputValue' /tmp/"${STACK_NAME}"-outputs.json)"
-IAM_TABLE="$(jq -r '.[] | select(.OutputKey=="IamAccountsTableName") | .OutputValue' /tmp/"${STACK_NAME}"-outputs.json)"
-
-_in_days() {
-  date -u -d "+$1 days" +%Y-%m-%d 2>/dev/null || date -u -v"+$1"d +%Y-%m-%d
-}
-
-# `put-item` is an unconditional upsert, so re-running deploy.sh is idempotent.
-# A seed failure must never abort an otherwise-successful deploy.
-seed_item() {
-  local table="$1" item="$2" label="$3"
-  if aws dynamodb put-item --table-name "$table" --region "$REGION" --item "$item"; then
-    echo "seed: wrote $label to $table"
-  else
-    echo "warning: failed to seed $label into $table — the UI may show no data for it until the next deploy" >&2
-  fi
-}
-
-# Expiry offsets deliberately span all three bands the UI colours:
-#   <= 7 days -> red    <= 30 days -> amber    else green
-# id|domain|days-to-expiry|type
-for row in \
-  "cert-001|payments.internal.example.com|3|ACM" \
-  "cert-002|sso.internal.example.com|21|Self-Signed" \
-  "cert-003|api.internal.example.com|75|On-Prem"
-do
-  IFS='|' read -r cert_id domain days cert_type <<<"$row"
-  seed_item "$CERT_TABLE" "$(cat <<EOF
-{
-  "CertId":      {"S": "${cert_id}"},
-  "CertType":    {"S": "${cert_type}"},
-  "OwnerId":     {"S": "${SEED_OWNER_ID}"},
-  "Domain":      {"S": "${domain}"},
-  "ExpiryDate":  {"S": "$(_in_days "$days")"},
-  "Status":      {"S": "ISSUED"},
-  "Source":      {"S": "seed"},
-  "Version":     {"N": "$(date +%s)"}
-}
-EOF
-)" "$cert_id"
-done
-
-# id|username|days-to-next-rotation|status
-for row in \
-  "hash-acct-001|svc-payments|4|warning" \
-  "hash-acct-002|svc-reporting|45|active"
-do
-  IFS='|' read -r account_hash user_name days status <<<"$row"
-  seed_item "$IAM_TABLE" "$(cat <<EOF
-{
-  "AccountIdHash":    {"S": "${account_hash}"},
-  "UserName":         {"S": "${user_name}"},
-  "OwnerId":          {"S": "${SEED_OWNER_ID}"},
-  "NextRotationDate": {"S": "$(_in_days "$days")"},
-  "Status":           {"S": "${status}"},
-  "Source":           {"S": "seed"}
-}
-EOF
-)" "$account_hash"
-done
+if [ "${SEED_DEMO_DATA:-true}" = "true" ]; then
+  REGION="$REGION" SEED_OWNER_ID="${SEED_OWNER_ID:-}" ./scripts/seed-demo-data.sh \
+    --certs "$SEED_CERTS" \
+    --accounts "$SEED_ACCOUNTS" \
+    --audit-events "$SEED_AUDIT_EVENTS" \
+    || echo "warning: demo data seeding failed — the UI may show no rows until it is re-run" >&2
+fi
 
 # --- Sync the static self-service UI to S3 and invalidate the CloudFront cache ---
 if [ -d "ui" ]; then

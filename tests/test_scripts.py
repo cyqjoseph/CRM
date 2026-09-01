@@ -116,3 +116,38 @@ def test_deploy_never_expands_acm_permissions_beyond_the_allowed_boundary():
     assert "put-role-policy" not in code
     assert "attach-role-policy" not in code
     assert "brd-architect-deploy-boundary" not in code
+
+
+def test_deploy_seeds_demo_data_through_the_seeder_script():
+    """deploy.sh used to carry ~130 lines of hand-written put-item heredocs with
+    hardcoded 2025 dates, which silently aged into the past and made every seeded
+    row render as long expired."""
+    code = _without_comments(DEPLOY)
+    assert "scripts/seed-demo-data.sh" in code
+    assert code.index("sam deploy") < code.index("scripts/seed-demo-data.sh"), (
+        "the tables must exist before anything is written to them"
+    )
+
+
+def test_deploy_seeding_cannot_abort_an_otherwise_successful_deploy():
+    code = _without_comments(DEPLOY)
+    call = code[code.index("scripts/seed-demo-data.sh"):][:400]
+    assert "||" in call, "a seeding failure must warn and continue, not exit non-zero"
+
+
+def test_seed_volume_and_owner_are_overridable_without_editing_the_script():
+    code = _without_comments(DEPLOY)
+    for var in ("SEED_OWNER_ID", "SEED_CERTS", "SEED_ACCOUNTS", "SEED_AUDIT_EVENTS"):
+        assert var in code, f"{var} must be settable from the environment"
+
+
+def test_seeder_only_ever_deletes_its_own_rows():
+    """--clean must be incapable of removing a genuinely discovered resource."""
+    seeder = (ROOT / "scripts" / "seed-demo-data.sh").read_text()
+    generator = (ROOT / "scripts" / "gen_demo_data.py").read_text()
+    assert "--delete" in seeder, "--clean must go through the generator, not ad-hoc deletes"
+    assert 'DEMO_PREFIX = "demo-"' in generator
+    # No unscoped destructive DynamoDB calls anywhere in the seeding path.
+    for name, script in (("seed-demo-data.sh", seeder), ("gen_demo_data.py", generator)):
+        assert "delete-table" not in script, f"{name} must never delete a table"
+        assert "scan" not in script.lower() or name.endswith(".py"), name
