@@ -887,7 +887,9 @@ Resources:
             TableName: !Ref AuditHotTable
         - Statement:
             - Effect: Allow
-              Action: states:DescribeExecution
+              Action:
+                - states:DescribeExecution
+                - states:GetExecutionHistory
               Resource:
                 - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${DiscoverySfn.Name}:*"
                 - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${RenewalSfn.Name}:*"

@@ -85,20 +85,58 @@ def _get_cert(table, claims, cert_id, request_id):
 
 
 def _renew_cert(table, claims, cert_id, request_id):
-    structured_log(request_id, "query_params", function="api-certs", table=CERT_TABLE_NAME, certId=cert_id, action="renew")
+    structured_log(
+        request_id, "renew_received", function="api-certs",
+        certId=cert_id, stateMachineArn=RENEWAL_STATE_MACHINE_ARN,
+    )
+
     response = table.get_item(Key={"CertId": cert_id})
     item = response.get("Item")
+    structured_log(
+        request_id, "renew_lookup", function="api-certs", table=CERT_TABLE_NAME,
+        certId=cert_id, found=item is not None,
+    )
     if not item:
         return api_response(404, {"message": "not found"})
     if not is_admin(claims) and item.get("OwnerId") != owner_id_of(claims):
+        structured_log(
+            request_id, "renew_forbidden", level="WARN", function="api-certs",
+            certId=cert_id, ownerId=item.get("OwnerId"),
+        )
         return api_response(404, {"message": "not found"})
 
-    sfn = boto3.client("stepfunctions")
-    execution = sfn.start_execution(
-        stateMachineArn=RENEWAL_STATE_MACHINE_ARN,
-        name=request_id,
-        input='{"certId": "%s", "certArn": "%s", "requestId": "%s"}'
-        % (cert_id, item.get("CertId", cert_id), request_id),
+    execution_input = '{"certId": "%s", "certArn": "%s", "requestId": "%s"}' % (
+        cert_id, item.get("CertId", cert_id), request_id,
+    )
+    structured_log(
+        request_id, "start_execution_attempt", function="api-certs",
+        certId=cert_id, stateMachineArn=RENEWAL_STATE_MACHINE_ARN, input=execution_input,
+    )
+
+    try:
+        sfn = boto3.client("stepfunctions")
+        execution = sfn.start_execution(
+            stateMachineArn=RENEWAL_STATE_MACHINE_ARN,
+            name=request_id,
+            input=execution_input,
+        )
+    except Exception as error:
+        structured_log(
+            request_id, "start_execution_error", level="ERROR", function="api-certs",
+            statusCode=500, certId=cert_id, stateMachineArn=RENEWAL_STATE_MACHINE_ARN,
+            error=str(error), errorType=type(error).__name__, stackTrace=traceback.format_exc(),
+        )
+        return api_response(500, {
+            "error": "Step Functions call failed",
+            "details": str(error),
+            "certId": cert_id,
+        })
+
+    execution_arn = execution["executionArn"]
+    execution_name = execution_arn.rsplit(":", 1)[-1]
+    structured_log(
+        request_id, "start_execution_response", function="api-certs",
+        certId=cert_id, executionArn=execution_arn, executionName=execution_name,
     )
 
     put_audit_event(
@@ -106,14 +144,21 @@ def _renew_cert(table, claims, cert_id, request_id):
         event_type="MANUAL_RENEWAL_TRIGGER",
         actor=owner_id_of(claims),
         outcome="STARTED",
-        detail={"requestId": request_id, "executionArn": execution["executionArn"]},
+        detail={"requestId": request_id, "executionArn": execution_arn},
     )
 
+    response = api_response(202, {
+        "executionArn": execution_arn,
+        "executionName": execution_name,
+        "certId": cert_id,
+        "status": "RUNNING",
+        "requestId": request_id,
+    })
     structured_log(
-        request_id, "renewal_started", function="api-certs",
-        certId=cert_id, executionArn=execution["executionArn"],
+        request_id, "renewal_started", function="api-certs", statusCode=202,
+        certId=cert_id, executionArn=execution_arn, executionName=execution_name,
     )
-    return api_response(202, {"executionArn": execution["executionArn"], "requestId": request_id})
+    return response
 
 
 @guard_api_handler

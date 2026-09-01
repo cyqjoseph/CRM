@@ -69,24 +69,52 @@ def _get_audit(table, claims, query_params, request_id):
 
 
 def _get_execution(claims, execution_id, request_id):
-    structured_log(request_id, "query_params", function="api-audit", executionArn=execution_id)
+    structured_log(request_id, "describe_execution_attempt", function="api-audit", executionArn=execution_id)
     sfn = boto3.client("stepfunctions")
     # execution_id is passed to the API as the executionArn returned by the
     # renew/rotate endpoints.
     try:
         response = sfn.describe_execution(executionArn=execution_id)
-    except Exception:
+    except Exception as error:
         structured_log(
-            request_id, "stepfunctions_error", level="ERROR", function="api-audit",
-            executionArn=execution_id, stackTrace=traceback.format_exc(),
+            request_id, "describe_execution_error", level="ERROR", function="api-audit",
+            statusCode=500, executionArn=execution_id, error=str(error),
+            errorType=type(error).__name__, stackTrace=traceback.format_exc(),
         )
-        raise
-    structured_log(request_id, "stepfunctions_response", function="api-audit", status=response["status"])
+        return api_response(500, {
+            "error": "DescribeExecution call failed",
+            "details": str(error),
+            "executionArn": execution_id,
+        })
+    structured_log(
+        request_id, "describe_execution_response", function="api-audit",
+        executionArn=execution_id, status=response["status"],
+    )
+
+    events = []
+    if response["status"] != "RUNNING":
+        # Only worth the extra call once the execution has settled — history
+        # is what tells us *which* state failed, beyond the terminal status.
+        try:
+            history = sfn.get_execution_history(
+                executionArn=execution_id, maxResults=20, reverseOrder=True,
+            )
+            events = [
+                {"type": e["type"], "timestamp": e["timestamp"].isoformat(), "id": e["id"]}
+                for e in history.get("events", [])
+            ]
+        except Exception as error:
+            structured_log(
+                request_id, "get_execution_history_error", level="ERROR", function="api-audit",
+                executionArn=execution_id, error=str(error), stackTrace=traceback.format_exc(),
+            )
+
     return api_response(
         200,
         {
             "status": response["status"],
             "output": response.get("output"),
+            "events": events,
         },
     )
 

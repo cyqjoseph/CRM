@@ -59,6 +59,28 @@ def test_list_without_a_sub_claim_is_401_not_a_dynamodb_error(mock_client, mock_
 
 @patch("boto3.resource")
 @patch("boto3.client")
+def test_renew_returns_500_with_details_when_start_execution_fails(mock_client, mock_resource):
+    table = MagicMock()
+    table.get_item.return_value = {"Item": {"CertId": "cert-1", "OwnerId": "owner-1"}}
+    mock_resource.return_value.Table.return_value = table
+
+    sfn = MagicMock()
+    sfn.start_execution.side_effect = Exception("AccessDeniedException: not authorized")
+    mock_client.return_value = sfn
+
+    response = app.handler(
+        _event("POST", cert_id="cert-1", resource="/certs/{certId}/renew"), None
+    )
+
+    assert response["statusCode"] == 500
+    body = json.loads(response["body"])
+    assert body["error"] == "Step Functions call failed"
+    assert "not authorized" in body["details"]
+    assert body["certId"] == "cert-1"
+
+
+@patch("boto3.resource")
+@patch("boto3.client")
 def test_renew_of_other_owners_cert_is_not_found(mock_client, mock_resource):
     table = MagicMock()
     table.get_item.return_value = {"Item": {"CertId": "cert-1", "OwnerId": "someone-else"}}

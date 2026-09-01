@@ -328,6 +328,47 @@ first. That header carries the caller's live Cognito ID token; logging it
 unredacted would let anyone with CloudWatch read access replay a live user
 session.
 
+## Diagnosing a silently-failing renewal
+
+The frontend's Renew button disables itself, calls `POST
+/certs/{certId}/renew`, and re-enables on any thrown error — so a hung or
+reverted button just means that call rejected, with no indication of *why*
+(a 403, a 500, or a Step Functions permissions gap all look identical from
+the browser). `api-certs-fn` and `api-audit-fn` now log and respond in a way
+that answers that from CloudWatch alone, without needing to reproduce the
+failure interactively:
+
+- **`api-certs-fn`** logs each step of the renewal path as its own structured
+  event (`renew_received`, `renew_lookup`, `start_execution_attempt`,
+  `start_execution_response`, `renewal_started`) instead of a single
+  `query_params`/`dynamodb_response` pair, so a CloudWatch Logs Insights
+  query can show exactly where a given `requestId` stopped progressing.
+- The `states:StartExecution` call is now wrapped in its own `try/except`,
+  separate from `guard_api_handler`'s generic catch-all. On failure it
+  returns `500 {"error": "Step Functions call failed", "details":
+  <exception message>, "certId": ...}` instead of `guard_api_handler`'s
+  generic `{"message": "internal error"}` — the exception message (e.g. an
+  `AccessDeniedException` naming the missing action) is usually enough to
+  tell a permissions gap from a missing state machine without opening the
+  Lambda's own logs.
+- On success, the response also carries `executionName` (parsed from
+  `executionArn`) and `status: "RUNNING"`, so a caller can go straight to
+  `GET /executions/{executionId}` (`executionArn` doubles as that path
+  parameter) to poll for completion.
+- **`GET /executions/{executionId}`** (`api-audit-fn`) follows the same
+  pattern: a failed `DescribeExecution` now returns `500` with the
+  exception's `details` rather than a bare `internal error`, and once an
+  execution has left `RUNNING`, the response's `events` field carries the
+  last 20 history entries (`states:GetExecutionHistory`, newest first) so a
+  `FAILED` execution shows which state failed, not just that it did.
+
+No infrastructure was missing for this: `ApiCertsFunction` already had
+`states:StartExecution` scoped to `RenewalSfn`'s ARN, `RenewalSfn` already
+existed (`app-d9fae51c-1929cc69-renewal-sfn`), and `GET
+/executions/{executionId}` already existed on `api-audit-fn`. The only IAM
+addition is `states:GetExecutionHistory` on `ApiAuditFunction`, alongside
+its existing `states:DescribeExecution` grant, for the history lookup above.
+
 ## Validating a deployment
 
 Both scripts resolve the stack's outputs themselves (`scripts/lib-stack-outputs.sh`),

@@ -1,3 +1,4 @@
+import json
 from unittest.mock import MagicMock, patch
 
 from conftest import load_module
@@ -42,3 +43,47 @@ def test_admin_can_query_any_entity(mock_resource):
     response = app.handler(_event("someone-elses-entity", claims), None)
     assert response["statusCode"] == 200
     assert table.query.called
+
+
+def _execution_event(execution_id, claims):
+    return {
+        "resource": "/executions/{executionId}",
+        "pathParameters": {"executionId": execution_id},
+        "queryStringParameters": None,
+        "requestContext": {"authorizer": {"claims": claims}},
+    }
+
+
+@patch("boto3.resource")
+@patch("boto3.client")
+def test_get_execution_returns_status_and_output(mock_client, mock_resource):
+    sfn = MagicMock()
+    sfn.describe_execution.return_value = {"status": "SUCCEEDED", "output": '{"ok": true}'}
+    sfn.get_execution_history.return_value = {"events": []}
+    mock_client.return_value = sfn
+
+    response = app.handler(
+        _execution_event("arn:aws:states:renewal:exec-1", {"sub": "owner-1"}), None
+    )
+
+    assert response["statusCode"] == 200
+    body = json.loads(response["body"])
+    assert body["status"] == "SUCCEEDED"
+    sfn.get_execution_history.assert_called_once()
+
+
+@patch("boto3.resource")
+@patch("boto3.client")
+def test_get_execution_returns_500_with_details_on_failure(mock_client, mock_resource):
+    sfn = MagicMock()
+    sfn.describe_execution.side_effect = Exception("AccessDeniedException: not authorized")
+    mock_client.return_value = sfn
+
+    response = app.handler(
+        _execution_event("arn:aws:states:renewal:exec-1", {"sub": "owner-1"}), None
+    )
+
+    assert response["statusCode"] == 500
+    body = json.loads(response["body"])
+    assert body["error"] == "DescribeExecution call failed"
+    assert "not authorized" in body["details"]
