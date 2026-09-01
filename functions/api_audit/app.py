@@ -5,6 +5,7 @@ caller to be in the Cognito admin group.
 """
 import os
 import traceback
+from urllib.parse import unquote
 
 import boto3
 from crm_common import (
@@ -68,11 +69,40 @@ def _get_audit(table, claims, query_params, request_id):
     return api_response(200, {"items": items})
 
 
+# An execution ARN is the path parameter here, and it is full of colons. The
+# browser must percent-encode them, and API Gateway REST APIs hand the parameter
+# to Lambda STILL ENCODED — `pathParameters` arrives as
+# "arn%3Aaws%3Astates%3A..." rather than "arn:aws:states:...". Passing that
+# straight to DescribeExecution fails with
+# `InvalidArn: Invalid ARN prefix: arn%3Aaws%3A...`, which reads like a bad ARN
+# from the caller rather than an un-decoded one.
+EXECUTION_ARN_PREFIX = "arn:aws:states:"
+
+
+def _decode_execution_arn(raw):
+    """Percent-decode the path parameter. A no-op on an already-decoded ARN,
+    since a well-formed ARN contains no '%'."""
+    return unquote(raw) if raw else raw
+
+
 def _get_execution(claims, execution_id, request_id):
+    execution_id = _decode_execution_arn(execution_id)
     structured_log(request_id, "describe_execution_attempt", function="api-audit", executionArn=execution_id)
+
+    # Reject a malformed ARN here with a 400 rather than letting botocore raise
+    # and reporting the caller's own bad input as a server error.
+    if not execution_id or not execution_id.startswith(EXECUTION_ARN_PREFIX):
+        structured_log(
+            request_id, "describe_execution_bad_arn", level="WARN", function="api-audit",
+            executionArn=execution_id,
+        )
+        return api_response(400, {
+            "error": "not a Step Functions execution ARN",
+            "details": f"expected a value starting with {EXECUTION_ARN_PREFIX!r}",
+            "executionArn": execution_id,
+        })
+
     sfn = boto3.client("stepfunctions")
-    # execution_id is passed to the API as the executionArn returned by the
-    # renew/rotate endpoints.
     try:
         response = sfn.describe_execution(executionArn=execution_id)
     except Exception as error:

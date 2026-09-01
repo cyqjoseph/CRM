@@ -36,6 +36,7 @@
     },
     "WriteRotationSuccessAudit": {
       "Type": "Task",
+      "ResultPath": null,
       "Resource": "arn:aws:states:::dynamodb:putItem",
       "Parameters": {
         "TableName": "${AuditTableName}",
@@ -51,6 +52,7 @@
     },
     "PublishRotationCompletion": {
       "Type": "Task",
+      "ResultPath": null,
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn": "${CompletionsTopicArn}",
@@ -61,6 +63,7 @@
     },
     "WriteRotationFailureAudit": {
       "Type": "Task",
+      "ResultPath": null,
       "Resource": "arn:aws:states:::dynamodb:putItem",
       "Parameters": {
         "TableName": "${AuditTableName}",

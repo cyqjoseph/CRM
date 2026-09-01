@@ -54,6 +54,7 @@
     },
     "WriteDiscoverySuccessAudit": {
       "Type": "Task",
+      "ResultPath": null,
       "Resource": "arn:aws:states:::dynamodb:putItem",
       "Parameters": {
         "TableName": "${AuditTableName}",
@@ -69,6 +70,7 @@
     },
     "WriteDiscoveryFailureAudit": {
       "Type": "Task",
+      "ResultPath": null,
       "Resource": "arn:aws:states:::dynamodb:putItem",
       "Parameters": {
         "TableName": "${AuditTableName}",

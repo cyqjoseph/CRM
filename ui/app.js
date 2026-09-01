@@ -122,13 +122,33 @@
 
   // --- API helpers ---
 
+  // Error bodies from this API come in two shapes. guard_api_handler returns
+  // {message}; the handlers that catch a specific AWS call themselves return
+  // {error, details} where `details` is the exception message — often an
+  // AccessDeniedException naming the exact denied action. Reading only `message`
+  // discarded precisely the field worth reading and left every failure as an
+  // opaque "request failed (500)".
+  function describeError(body, status) {
+    const parts = [body.error, body.details, body.message].filter(Boolean);
+    if (!parts.length) return `request failed (${status})`;
+    return `${parts.join(": ")} (${status})`;
+  }
+
   async function apiFetch(path, options) {
     const response = await fetch(cfg.apiUrl.replace(/\/$/, "") + path, {
       ...options,
       headers: { ...(options && options.headers), Authorization: idToken },
     });
     const body = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(body.message || `request failed (${response.status})`);
+    if (!response.ok) {
+      const error = new Error(describeError(body, response.status));
+      error.status = response.status;
+      error.body = body;
+      // Also log it: the message shown in the UI is necessarily short, and the
+      // full body is what a reader actually needs when diagnosing a 500.
+      console.error(`${options && options.method} ${path} -> ${response.status}`, body);
+      throw error;
+    }
     return body;
   }
 
@@ -149,18 +169,26 @@
   }
 
   async function awaitExecution(executionArn) {
+    let lastError = null;
     for (let attempt = 0; attempt < POLL_MAX_ATTEMPTS; attempt += 1) {
       await sleep(POLL_INTERVAL_MS);
-      let result;
       try {
-        result = await apiFetch(`/executions/${encodeURIComponent(executionArn)}`, { method: "GET" });
+        const result = await apiFetch(`/executions/${encodeURIComponent(executionArn)}`, { method: "GET" });
+        if (result.status && result.status !== "RUNNING") return result;
+        lastError = null;
       } catch (err) {
-        // A single failed poll is not a failed execution — keep trying, and only
-        // surface the error if we never get a terminal status.
-        continue;
+        // One failed poll is not a failed execution, so keep trying — but a
+        // poll that fails *every* time is a fault in its own right and must be
+        // reported as one. Swallowing it and reporting "still running" was the
+        // same invisibility bug this poller was added to fix, one layer up.
+        lastError = err;
+        // Any 4xx is a fault in the request itself (a malformed ARN, a missing
+        // grant) and will never become a 200 — retrying it 20 times just makes
+        // the user wait 30s for an answer already known on the first attempt.
+        if (err.status >= 400 && err.status < 500) break;
       }
-      if (result.status && result.status !== "RUNNING") return result;
     }
+    if (lastError) return { status: "POLL_FAILED", error: lastError };
     return { status: "TIMED_OUT" };
   }
 
@@ -183,6 +211,19 @@
         button.textContent = original;
         button.disabled = false;
         setError(errorFieldId, `${labels.noun} is still running — refresh the tab to see the result.`);
+        return;
+      }
+      if (outcome.status === "POLL_FAILED") {
+        // The action itself may well have succeeded — only the status lookup
+        // failed. Say exactly that, and show the underlying error rather than
+        // implying the renewal/rotation failed.
+        button.textContent = original;
+        button.disabled = false;
+        setError(
+          errorFieldId,
+          `${labels.noun} started, but checking its status failed: ${outcome.error.message}. ` +
+            `The ${labels.noun.toLowerCase()} itself may still have succeeded — refresh the tab.`
+        );
         return;
       }
       // FAILED / TIMED_OUT / ABORTED: name the state that failed if we have it.

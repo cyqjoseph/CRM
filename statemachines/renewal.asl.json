@@ -25,6 +25,7 @@
     },
     "WriteRenewalSuccessAudit": {
       "Type": "Task",
+      "ResultPath": null,
       "Resource": "arn:aws:states:::dynamodb:putItem",
       "Parameters": {
         "TableName": "${AuditTableName}",
@@ -41,6 +42,7 @@
     },
     "PublishRenewalCompletion": {
       "Type": "Task",
+      "ResultPath": null,
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn": "${CompletionsTopicArn}",
@@ -51,6 +53,7 @@
     },
     "WriteRenewalFailureAudit": {
       "Type": "Task",
+      "ResultPath": null,
       "Resource": "arn:aws:states:::dynamodb:putItem",
       "Parameters": {
         "TableName": "${AuditTableName}",

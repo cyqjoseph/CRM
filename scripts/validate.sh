@@ -178,11 +178,18 @@ EXECUTION_ARN="$(printf '%s' "$RENEW_JSON" | jq -r '.executionArn // empty')"
        A \"Step Functions call failed\" error here names the denied action."
 pass "POST /certs/$SEEDED_CERT_ID/renew -> 202 ($EXECUTION_ARN)"
 
+# Percent-encode the ARN exactly as the browser's encodeURIComponent does. This
+# matters: an execution ARN is full of colons, and curl will happily send them
+# raw (which API Gateway delivers decoded) while the browser cannot. Testing the
+# raw form passed here while every poll in the browser failed with
+# `InvalidArn: Invalid ARN prefix: arn%3Aaws%3A...`.
+ENCODED_ARN="$(printf '%s' "$EXECUTION_ARN" | jq -sRr @uri)"
+
 # The renewal state machine settles in a couple of seconds; poll rather than sleep.
 EXECUTION_STATUS="RUNNING"
 for _ in $(seq 1 20); do
   sleep 2
-  EXECUTION_JSON="$(curl -s "$API_URL/executions/$EXECUTION_ARN" -H "Authorization: $ID_TOKEN")"
+  EXECUTION_JSON="$(curl -s "$API_URL/executions/$ENCODED_ARN" -H "Authorization: $ID_TOKEN")"
   EXECUTION_STATUS="$(printf '%s' "$EXECUTION_JSON" | jq -r '.status // "UNKNOWN"')"
   [ "$EXECUTION_STATUS" = "RUNNING" ] || break
 done

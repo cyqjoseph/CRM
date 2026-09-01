@@ -49,3 +49,38 @@ def test_the_poller_is_bounded():
     """An unbounded poll loop would hang the button forever on a stuck execution."""
     assert "POLL_MAX_ATTEMPTS" in APP_JS
     assert "TIMED_OUT" in APP_JS
+
+
+def test_error_bodies_are_read_from_error_and_details_not_only_message():
+    """api-audit-fn/api-certs-fn return {error, details} when they catch a
+    specific AWS call; guard_api_handler returns {message}.
+
+    Reading only `message` discarded `details` — the field holding the actual
+    exception, often an AccessDeniedException naming the denied action — and
+    turned every such failure into an opaque "request failed (500)".
+    """
+    assert "describeError" in APP_JS
+    for field in ("body.error", "body.details", "body.message"):
+        assert field in APP_JS, f"apiFetch ignores {field}"
+
+
+def test_a_persistently_failing_poll_is_reported_not_swallowed():
+    """The poller used to `continue` past every error and then claim the
+    execution was "still running" — the same invisibility bug it was added to
+    fix, one layer down."""
+    assert "POLL_FAILED" in APP_JS
+    assert "lastError" in APP_JS
+
+
+def test_a_poll_failure_does_not_claim_the_action_itself_failed():
+    """Only the status lookup failed; the renewal may well have succeeded."""
+    start = APP_JS.index('outcome.status === "POLL_FAILED"')
+    body = APP_JS[start : start + 600]
+    assert "checking its status failed" in body
+    assert "may still have succeeded" in body
+
+
+def test_a_hopeless_poll_gives_up_early():
+    """Any 4xx will never become a 200 — retrying it 20 times just makes the
+    user wait 30s for an error already known on the first attempt."""
+    assert "err.status >= 400 && err.status < 500" in APP_JS
