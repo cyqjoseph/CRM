@@ -15,6 +15,9 @@ from crm_common import (
     new_request_id,
     now_iso,
     owner_id_of,
+    request_headers,
+    request_origin,
+    sanitize_event_for_logging,
     structured_log,
 )
 
@@ -98,6 +101,8 @@ def handler(event, context):
     structured_log(
         request_id, "start", function="api-audit", timestamp=now_iso(),
         table=AUDIT_TABLE_NAME, method=event.get("httpMethod"), resource=resource_path,
+        event=sanitize_event_for_logging(event), headers=request_headers(event),
+        origin=request_origin(event),
     )
 
     if resource_path.startswith("/executions/"):
@@ -109,5 +114,6 @@ def handler(event, context):
     structured_log(
         request_id, "returning_response", function="api-audit",
         statusCode=response["statusCode"], body=response["body"],
+        corsHeaders=response.get("headers"),
     )
     return response

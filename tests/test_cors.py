@@ -87,6 +87,22 @@ def test_lambda_responses_include_the_cors_header():
     assert json.loads(response["body"]) == {"items": []}
 
 
+def test_lambda_responses_include_allow_methods_and_allow_headers():
+    """Diagnostic hardening: every real response, not just the OPTIONS mock
+    Cors generates, carries the same allow-list so a proxy/cache stripping the
+    preflight response doesn't leave the real GET/POST response looking
+    unconfigured in browser devtools."""
+    from crm_common import api_response
+
+    response = api_response(200, {"items": []})
+    methods = response["headers"]["Access-Control-Allow-Methods"]
+    headers = response["headers"]["Access-Control-Allow-Headers"]
+    for method in ("GET", "POST", "OPTIONS"):
+        assert method in methods
+    assert "content-type" in headers.lower()
+    assert "authorization" in headers.lower()
+
+
 @pytest.mark.parametrize("status", [200, 202, 404])
 def test_cors_header_present_on_every_status_the_api_returns(status):
     from crm_common import api_response

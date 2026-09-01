@@ -277,6 +277,57 @@ anything:
   fix above — so a future regression on either front fails this suite
   instead of passing silently.
 
+## Fixed test-data seed and CORS/health diagnostics
+
+Two follow-up changes address a specific complaint: the frontend was getting
+403s calling the API, and the discovery Lambdas couldn't be invoked by hand
+(permissions-boundary restrictions) to check whether data was flowing at all.
+
+**Fixed test-data seed (temporary, until real discovery is enabled).**
+`./deploy.sh` now writes three fixed certificate rows (`cert-001`/`cert-002`/
+`cert-003`, one per `Status`: `active`/`warning`/`critical`) into
+`cert-inventory`, and two fixed IAM-account rows (`hash-acct-001`/
+`hash-acct-002`, `RotationStatus` `pending`/`overdue`) into `iam-accounts` —
+all five owned by the same fixed `OwnerId`
+(`d9ca551c-d0a1-7011-1c4f-99a48c8d917f`). It runs right after `sam deploy`,
+using the same `aws dynamodb put-item` mechanism (and the same non-fatal
+`||`-on-failure convention) as the pre-existing simulated-ACM-cert seed
+above it. `put-item` is an unconditional upsert, so re-running `./deploy.sh`
+is safe. This is deliberately a *different* mechanism from
+`scripts/seed.sh`: that script resolves a real Cognito `sub` so a specific
+logged-in user sees data (see *An empty Certificates tab...* above); this
+seed uses one fixed id purely so the tables are non-empty and the
+DynamoDB → Lambda → API Gateway path can be checked end to end without
+needing a login at all. No `./destroy.sh` change was needed — deleting the
+stack deletes both DynamoDB tables, which deletes every item in them.
+
+**`GET /health`.** A new `api-health-fn` behind `GET /health` has no Cognito
+authorizer (`Auth: {Authorizer: NONE}` on that route only) and always
+returns `200 {"status": "ok"}`. It exists to separate two failure modes that
+otherwise look identical from a browser: "the authorizer/CORS is rejecting
+me" versus "nothing is wired up at all." If `/health` 403s, the problem is
+upstream of any Lambda (API Gateway, CloudFront, or the route itself); if
+`/health` works but `/certs` doesn't, the problem is auth- or CORS-specific.
+
+**CORS headers on every response.** `crm_common.api_response()` already set
+`Access-Control-Allow-Origin`; it now also sets
+`Access-Control-Allow-Methods` (`GET, POST, OPTIONS`) and
+`Access-Control-Allow-Headers` (`Content-Type, Authorization`) on every
+response from `api-certs-fn`, `api-iam-fn`, `api-audit-fn`, and `api-health-fn`
+— not just the API Gateway `Cors` property's mock `OPTIONS` preflight
+response, which never touches a real request.
+
+**Richer structured logging.** Every API Lambda's `start` log event now
+includes the incoming event, request headers, and the `Origin` header;
+every `returning_response` event includes the response's CORS headers. This
+makes a live 403 diagnosable from CloudWatch Logs alone: is `Origin` even
+present, did the Lambda see the request at all, what did it send back. The
+raw event and headers are **never logged verbatim** — `crm_common.request_headers`/
+`sanitize_event_for_logging` redact `Authorization` to `"***redacted***"`
+first. That header carries the caller's live Cognito ID token; logging it
+unredacted would let anyone with CloudWatch read access replay a live user
+session.
+
 ## Validating a deployment
 
 Both scripts resolve the stack's outputs themselves (`scripts/lib-stack-outputs.sh`),

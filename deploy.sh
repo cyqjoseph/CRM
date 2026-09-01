@@ -122,6 +122,7 @@ aws lambda invoke --function-name app-d9fae51c-1929cc69-discovery-acm-fn \
 # rows simulate that inventory directly, correlated by instance id, so the UI's
 # certificate dashboard has real EC2-backed data to show end to end.
 CERT_TABLE="$(jq -r '.[] | select(.OutputKey=="CertInventoryTableName") | .OutputValue' /tmp/"${STACK_NAME}"-outputs.json)"
+IAM_TABLE="$(jq -r '.[] | select(.OutputKey=="IamAccountsTableName") | .OutputValue' /tmp/"${STACK_NAME}"-outputs.json)"
 for i in 1 2 3; do
   INSTANCE_ID="$(jq -r ".[] | select(.OutputKey==\"TestInstance${i}Id\") | .OutputValue" /tmp/"${STACK_NAME}"-outputs.json)"
   DOMAIN="crm-test-${i}.internal.example.com"
@@ -144,6 +145,95 @@ for i in 1 2 3; do
       \"Version\": {\"N\": \"1\"}
     }"
 done
+
+# --- WORKAROUND: seed fixed test data into cert-inventory/iam-accounts -------
+# The discovery Lambdas can't yet be exercised end to end here (see README's
+# Deviations section), so this writes a known, fixed set of rows directly —
+# same `dynamodb put-item` mechanism as the simulated ACM certs above — so the
+# UI's Certificates/IAM Accounts tabs and the DynamoDB -> API Lambda -> API
+# Gateway -> Frontend path all have real data to render immediately. This is
+# temporary; real discovery populates these tables once it is fully wired up.
+# `put-item` is itself idempotent (an unconditional upsert), and a failure
+# here must never abort an otherwise-successful deploy — same convention as
+# the discovery Lambda invocations above.
+TEST_OWNER_ID="d9ca551c-d0a1-7011-1c4f-99a48c8d917f"
+
+seed_item() {
+  local table="$1" item="$2" label="$3"
+  if aws dynamodb put-item --table-name "$table" --region "$REGION" --item "$item"; then
+    echo "seed: wrote $label to $table"
+  else
+    echo "warning: failed to seed $label into $table — the UI may show no data for it until the next deploy" >&2
+  fi
+}
+
+seed_item "$CERT_TABLE" "$(cat <<EOF
+{
+  "CertId":      {"S": "cert-001"},
+  "CertType":    {"S": "ACM"},
+  "OwnerId":     {"S": "${TEST_OWNER_ID}"},
+  "ExpiryDate":  {"S": "2025-12-31T23:59:59Z"},
+  "Status":      {"S": "active"},
+  "Source":      {"S": "ACM"},
+  "CreatedAt":   {"S": "2026-01-01T00:00:00Z"},
+  "Description": {"S": "Test ACM Certificate 1"}
+}
+EOF
+)" "cert-001"
+
+seed_item "$CERT_TABLE" "$(cat <<EOF
+{
+  "CertId":      {"S": "cert-002"},
+  "CertType":    {"S": "Self-Signed"},
+  "OwnerId":     {"S": "${TEST_OWNER_ID}"},
+  "ExpiryDate":  {"S": "2025-06-30T23:59:59Z"},
+  "Status":      {"S": "warning"},
+  "Source":      {"S": "Manual"},
+  "CreatedAt":   {"S": "2026-01-01T00:00:00Z"},
+  "Description": {"S": "Test Self-Signed Certificate"}
+}
+EOF
+)" "cert-002"
+
+seed_item "$CERT_TABLE" "$(cat <<EOF
+{
+  "CertId":      {"S": "cert-003"},
+  "CertType":    {"S": "On-Prem"},
+  "OwnerId":     {"S": "${TEST_OWNER_ID}"},
+  "ExpiryDate":  {"S": "2025-03-15T23:59:59Z"},
+  "Status":      {"S": "critical"},
+  "Source":      {"S": "Internal"},
+  "CreatedAt":   {"S": "2026-01-01T00:00:00Z"},
+  "Description": {"S": "Test On-Prem Certificate"}
+}
+EOF
+)" "cert-003"
+
+seed_item "$IAM_TABLE" "$(cat <<EOF
+{
+  "AccountIdHash":    {"S": "hash-acct-001"},
+  "OwnerId":          {"S": "${TEST_OWNER_ID}"},
+  "Domain":           {"S": "example.com"},
+  "NextRotationDate": {"S": "2025-12-15T00:00:00Z"},
+  "RotationStatus":   {"S": "pending"},
+  "CreatedAt":        {"S": "2026-01-01T00:00:00Z"},
+  "AccountName":      {"S": "Example Corp IAM Account"}
+}
+EOF
+)" "hash-acct-001"
+
+seed_item "$IAM_TABLE" "$(cat <<EOF
+{
+  "AccountIdHash":    {"S": "hash-acct-002"},
+  "OwnerId":          {"S": "${TEST_OWNER_ID}"},
+  "Domain":           {"S": "internal.local"},
+  "NextRotationDate": {"S": "2025-09-30T00:00:00Z"},
+  "RotationStatus":   {"S": "overdue"},
+  "CreatedAt":        {"S": "2026-01-01T00:00:00Z"},
+  "AccountName":      {"S": "Internal IAM Account"}
+}
+EOF
+)" "hash-acct-002"
 
 # --- Sync the static self-service UI to S3 and invalidate the CloudFront cache ---
 if [ -d "ui" ]; then

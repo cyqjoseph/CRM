@@ -33,9 +33,11 @@ Globals:
     PermissionsBoundary: arn:aws:iam::544635841962:policy/brd-architect-deploy-boundary
     Environment:
       Variables:
-        # Kept in step with CrmApi's Cors.AllowOrigin. SAM merges these Globals
-        # variables with each function's own Environment.Variables.
+        # Kept in step with CrmApi's Cors property below. SAM merges these
+        # Globals variables with each function's own Environment.Variables.
         CORS_ALLOW_ORIGIN: "*"
+        CORS_ALLOW_METHODS: "GET, POST, OPTIONS"
+        CORS_ALLOW_HEADERS: "Content-Type, Authorization"
     Layers:
       - !Ref CommonLayer
 
@@ -913,6 +915,36 @@ Resources:
             Path: /executions/{executionId}
             Method: get
 
+  # Unauthenticated connectivity probe used to tell a dead CloudFront/API
+  # Gateway/Lambda wiring apart from a CORS or Cognito-authorizer failure —
+  # every other route requires a valid Cognito token, so a 403 there is
+  # ambiguous between "no token" and "the plumbing itself is broken".
+  ApiHealthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: app-d9fae51c-1929cc69-api-health-fn
+      CodeUri: functions/api_health/
+      Handler: app.handler
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                - logs:DescribeLogGroups
+                - logs:DescribeLogStreams
+              Resource: "*"
+      Events:
+        HealthCheck:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CrmApi
+            Path: /health
+            Method: get
+            Auth:
+              Authorizer: NONE
+
   ApiPasswordResetsFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -1601,6 +1633,23 @@ Resources:
       AlarmActions:
         - !Ref OpsAlarmsTopic
 
+  LambdaErrorAlarmApiHealth:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: app-d9fae51c-1929cc69-api-health-fn-errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ApiHealthFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref OpsAlarmsTopic
+
   LambdaErrorAlarmApiPasswordResets:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -1676,6 +1725,7 @@ Resources:
                   ["AWS/Lambda", "Errors", "FunctionName", "${ApiCertsFunction}"],
                   ["AWS/Lambda", "Errors", "FunctionName", "${ApiIamFunction}"],
                   ["AWS/Lambda", "Errors", "FunctionName", "${ApiAuditFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${ApiHealthFunction}"],
                   ["AWS/Lambda", "Errors", "FunctionName", "${SyncOnPremFunction}"],
                   ["AWS/Lambda", "Errors", "FunctionName", "${AuditExporterFunction}"],
                   ["AWS/Lambda", "Errors", "FunctionName", "${ApiPasswordResetsFunction}"],

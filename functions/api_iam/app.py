@@ -12,6 +12,9 @@ from crm_common import (
     now_iso,
     owner_id_of,
     put_audit_event,
+    request_headers,
+    request_origin,
+    sanitize_event_for_logging,
     structured_log,
 )
 
@@ -123,6 +126,8 @@ def handler(event, context):
     structured_log(
         request_id, "start", function="api-iam", timestamp=now_iso(),
         table=IAM_TABLE_NAME, method=method, resource=resource_path,
+        event=sanitize_event_for_logging(event), headers=request_headers(event),
+        origin=request_origin(event),
     )
 
     table = boto3.resource("dynamodb").Table(IAM_TABLE_NAME)
@@ -139,5 +144,6 @@ def handler(event, context):
     structured_log(
         request_id, "returning_response", function="api-iam",
         statusCode=response["statusCode"], body=response["body"],
+        corsHeaders=response.get("headers"),
     )
     return response

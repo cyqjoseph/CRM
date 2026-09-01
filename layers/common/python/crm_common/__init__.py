@@ -17,7 +17,10 @@ AUDIT_TTL_DAYS = int(os.environ.get("AUDIT_TTL_DAYS", "90"))
 # The API's Cors property only generates the OPTIONS preflight method. A Lambda
 # proxy integration's own responses carry exactly the headers the function sets,
 # so every real response needs this header too or the browser blocks the read.
+# Kept in step with CrmApi's Cors property in template.yaml.
 CORS_ALLOW_ORIGIN = os.environ.get("CORS_ALLOW_ORIGIN", "*")
+CORS_ALLOW_METHODS = os.environ.get("CORS_ALLOW_METHODS", "GET, POST, OPTIONS")
+CORS_ALLOW_HEADERS = os.environ.get("CORS_ALLOW_HEADERS", "Content-Type, Authorization")
 
 
 def dynamodb_resource():
@@ -71,6 +74,8 @@ def api_response(status_code, body):
         "headers": {
             "Content-Type": "application/json",
             "Access-Control-Allow-Origin": CORS_ALLOW_ORIGIN,
+            "Access-Control-Allow-Methods": CORS_ALLOW_METHODS,
+            "Access-Control-Allow-Headers": CORS_ALLOW_HEADERS,
         },
         "body": json.dumps(body, cls=DecimalEncoder),
     }
@@ -108,6 +113,44 @@ def guard_api_handler(handler):
             return api_response(500, {"message": "internal error"})
 
     return wrapper
+
+
+def _redact_headers(headers):
+    if not headers:
+        return {}
+    return {
+        key: ("***redacted***" if key.lower() == "authorization" else value)
+        for key, value in headers.items()
+    }
+
+
+def request_headers(event):
+    """This event's headers, with Authorization redacted.
+
+    Authorization carries the caller's live Cognito ID token — logging it
+    verbatim would let anyone with CloudWatch read access replay the request
+    as that user, so every diagnostic log goes through this instead of the
+    raw `event["headers"]`.
+    """
+    return _redact_headers((event or {}).get("headers"))
+
+
+def request_origin(event):
+    headers = (event or {}).get("headers") or {}
+    return headers.get("Origin") or headers.get("origin")
+
+
+def sanitize_event_for_logging(event):
+    """A copy of the API Gateway event safe to pass to `structured_log`."""
+    event = dict(event or {})
+    if event.get("headers"):
+        event["headers"] = _redact_headers(event["headers"])
+    if event.get("multiValueHeaders"):
+        event["multiValueHeaders"] = {
+            key: value if key.lower() != "authorization" else ["***redacted***"]
+            for key, value in event["multiValueHeaders"].items()
+        }
+    return event
 
 
 def get_claims(event):

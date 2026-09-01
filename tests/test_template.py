@@ -50,6 +50,7 @@ REQUIRED_ROUTES = {
     ("/password-resets", "get"),
     ("/password-resets/{requestId}/approve", "post"),
     ("/password-resets/{requestId}/reject", "post"),
+    ("/health", "get"),
 }
 
 # Actions that AWS's IAM Service Authorization Reference documents as NOT
