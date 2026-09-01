@@ -1,5 +1,6 @@
 """api-certs-fn: GET /certs, GET /certs/{certId}, POST /certs/{certId}/renew."""
 import os
+import traceback
 
 import boto3
 from crm_common import (
@@ -8,41 +9,71 @@ from crm_common import (
     guard_api_handler,
     is_admin,
     new_request_id,
+    now_iso,
     owner_id_of,
     put_audit_event,
+    structured_log,
 )
 
 CERT_TABLE_NAME = os.environ["CERT_TABLE_NAME"]
 RENEWAL_STATE_MACHINE_ARN = os.environ["RENEWAL_STATE_MACHINE_ARN"]
 
 
-def _list_certs(table, claims, query_params):
+def _list_certs(table, claims, query_params, request_id):
     query_params = query_params or {}
     if is_admin(claims) and query_params.get("ownerId"):
         owner_id = query_params["ownerId"]
     else:
         owner_id = owner_id_of(claims)
 
+    structured_log(
+        request_id, "query_params", function="api-certs", table=CERT_TABLE_NAME,
+        action="query_all_certs", ownerId=owner_id, status=query_params.get("status"),
+    )
+
     if not owner_id:
         # DynamoDB rejects an empty string for a key attribute, so an absent
         # `sub` would raise ValidationException here rather than return nothing —
         # another unhandled exception surfacing in the browser as a 502.
+        structured_log(request_id, "unauthenticated", level="WARN", function="api-certs")
         return api_response(401, {"message": "unauthenticated"})
 
-    response = table.query(
-        IndexName="OwnerIndex",
-        KeyConditionExpression="OwnerId = :owner",
-        ExpressionAttributeValues={":owner": owner_id},
-    )
+    try:
+        response = table.query(
+            IndexName="OwnerIndex",
+            KeyConditionExpression="OwnerId = :owner",
+            ExpressionAttributeValues={":owner": owner_id},
+        )
+    except Exception:
+        structured_log(
+            request_id, "dynamodb_error", level="ERROR", function="api-certs",
+            table=CERT_TABLE_NAME, stackTrace=traceback.format_exc(),
+        )
+        raise
+
     items = response.get("Items", [])
+    structured_log(
+        request_id, "dynamodb_response", function="api-certs", table=CERT_TABLE_NAME,
+        count=len(items), firstItem=items[0] if items else None,
+    )
+
     if query_params.get("status"):
         items = [i for i in items if i.get("Status") == query_params["status"]]
     return api_response(200, {"items": items})
 
 
-def _get_cert(table, claims, cert_id):
-    response = table.get_item(Key={"CertId": cert_id})
+def _get_cert(table, claims, cert_id, request_id):
+    structured_log(request_id, "query_params", function="api-certs", table=CERT_TABLE_NAME, certId=cert_id)
+    try:
+        response = table.get_item(Key={"CertId": cert_id})
+    except Exception:
+        structured_log(
+            request_id, "dynamodb_error", level="ERROR", function="api-certs",
+            table=CERT_TABLE_NAME, stackTrace=traceback.format_exc(),
+        )
+        raise
     item = response.get("Item")
+    structured_log(request_id, "dynamodb_response", function="api-certs", table=CERT_TABLE_NAME, found=item is not None)
     if not item:
         return api_response(404, {"message": "not found"})
     if not is_admin(claims) and item.get("OwnerId") != owner_id_of(claims):
@@ -50,7 +81,8 @@ def _get_cert(table, claims, cert_id):
     return api_response(200, item)
 
 
-def _renew_cert(table, claims, cert_id):
+def _renew_cert(table, claims, cert_id, request_id):
+    structured_log(request_id, "query_params", function="api-certs", table=CERT_TABLE_NAME, certId=cert_id, action="renew")
     response = table.get_item(Key={"CertId": cert_id})
     item = response.get("Item")
     if not item:
@@ -59,7 +91,6 @@ def _renew_cert(table, claims, cert_id):
         return api_response(404, {"message": "not found"})
 
     sfn = boto3.client("stepfunctions")
-    request_id = new_request_id()
     execution = sfn.start_execution(
         stateMachineArn=RENEWAL_STATE_MACHINE_ARN,
         name=request_id,
@@ -75,24 +106,40 @@ def _renew_cert(table, claims, cert_id):
         detail={"requestId": request_id, "executionArn": execution["executionArn"]},
     )
 
+    structured_log(
+        request_id, "renewal_started", function="api-certs",
+        certId=cert_id, executionArn=execution["executionArn"],
+    )
     return api_response(202, {"executionArn": execution["executionArn"], "requestId": request_id})
 
 
 @guard_api_handler
 def handler(event, context):
+    request_id = new_request_id()
     claims = get_claims(event)
-    table = boto3.resource("dynamodb").Table(CERT_TABLE_NAME)
-
     method = event.get("httpMethod")
     path_params = event.get("pathParameters") or {}
     cert_id = path_params.get("certId")
     resource_path = event.get("resource", "")
 
-    if method == "GET" and cert_id is None:
-        return _list_certs(table, claims, event.get("queryStringParameters"))
-    if method == "GET" and cert_id is not None:
-        return _get_cert(table, claims, cert_id)
-    if method == "POST" and resource_path.endswith("/renew"):
-        return _renew_cert(table, claims, cert_id)
+    structured_log(
+        request_id, "start", function="api-certs", timestamp=now_iso(),
+        table=CERT_TABLE_NAME, method=method, resource=resource_path,
+    )
 
-    return api_response(404, {"message": "not found"})
+    table = boto3.resource("dynamodb").Table(CERT_TABLE_NAME)
+
+    if method == "GET" and cert_id is None:
+        response = _list_certs(table, claims, event.get("queryStringParameters"), request_id)
+    elif method == "GET" and cert_id is not None:
+        response = _get_cert(table, claims, cert_id, request_id)
+    elif method == "POST" and resource_path.endswith("/renew"):
+        response = _renew_cert(table, claims, cert_id, request_id)
+    else:
+        response = api_response(404, {"message": "not found"})
+
+    structured_log(
+        request_id, "returning_response", function="api-certs",
+        statusCode=response["statusCode"], body=response["body"],
+    )
+    return response
