@@ -103,7 +103,9 @@ can additionally query the full audit trail for any entity.
   execution — since there's no credential to generate.
 
 All infrastructure is defined in `template.yaml` (AWS SAM). `deploy.sh`
-builds and deploys the stack, creates 3 EC2 `t3.micro` test instances and
+builds and deploys the stack, invokes `discovery-iam-fn` and `discovery-acm-fn`
+once so both inventory tables have data immediately rather than waiting for
+the daily `DiscoveryScheduleRule`, creates 3 EC2 `t3.micro` test instances and
 seeds simulated ACM certificate rows correlated to their instance IDs, syncs
 the UI to S3, writes `ui/config.js` with the deployed Cognito/API values, and
 invalidates the CloudFront cache. `destroy.sh` tears everything down.
@@ -180,6 +182,20 @@ authoritative. Concretely:
   simulating the row is the only way to populate the certificate inventory
   with realistic-looking EC2-correlated data at all. `destroy.sh` terminates
   the same instances and removes the registry secret.
+- **`discovery-acm-fn`'s ACM calls are denied by design, not by a missing
+  grant**: the function's own IAM policy already grants
+  `acm:ListCertificates`/`acm:DescribeCertificate`, but every invocation still
+  gets `AccessDeniedException ... no permissions boundary allows the
+  acm:ListCertificates action`. ACM is not in CLAUDE.md's exhaustive
+  allowed-services list, so the account-wide permissions boundary
+  (`brd-architect-deploy-boundary`, referenced but not owned by this
+  template) denies it regardless of what the function's own policy grants —
+  adding more of the same permissions to the role cannot change that. This is
+  why each discovery source (ACM/IAM server certs/Secrets Manager) is wrapped
+  independently: the ACM branch fails every run, and the other two, plus the
+  simulated rows above, still populate the table. `deploy.sh` invokes both
+  discovery Lambdas directly once after every deploy for exactly this reason
+  — it can't wait on a boundary-denied source to eventually succeed.
 - **IAM key "rotation" flags rather than mutates**: `rotation-iam-key-fn`
   makes zero IAM API calls (no `CreateAccessKey`/`DeactivateAccessKey`/
   `DeleteAccessKey`). Automatically deactivating or deleting a live access

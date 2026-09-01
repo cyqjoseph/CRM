@@ -91,3 +91,31 @@ def test_deploy_never_uses_the_shared_sam_managed_bucket():
     assert "--resolve-s3" not in code
     assert "--guided" not in code
     assert "app-d9fae51c-1929cc69-artifacts" in code
+
+
+def test_deploy_invokes_both_discovery_lambdas_after_the_stack_is_up():
+    # cert-inventory/iam-accounts are otherwise empty until the daily
+    # DiscoveryScheduleRule fires; invoking the real discovery Lambdas once
+    # right after deploy gives both tables data immediately.
+    code = _without_comments(DEPLOY)
+    assert "app-d9fae51c-1929cc69-discovery-iam-fn" in code
+    assert "app-d9fae51c-1929cc69-discovery-acm-fn" in code
+    assert code.count("aws lambda invoke") == 2
+    # CLI v2 requires this for a blob (Payload) parameter passed as raw JSON.
+    assert "--cli-binary-format raw-in-base64-out" in code
+    # A discovery Lambda failing (e.g. discovery-acm-fn's ACM sub-scan, which the
+    # account's permissions boundary denies since ACM isn't an allowed service)
+    # must never fail the whole deploy.
+    assert code.index("sam deploy") < code.index("discovery-iam-fn"), (
+        "the discovery Lambdas must be invoked after the stack exists"
+    )
+
+
+def test_deploy_never_expands_acm_permissions_beyond_the_allowed_boundary():
+    # ACM is not in CLAUDE.md's exhaustive allowed-services list, so the account
+    # permissions boundary denies it on purpose. deploy.sh must not attempt to
+    # work around that by touching IAM policies/boundaries at deploy time.
+    code = _without_comments(DEPLOY)
+    assert "put-role-policy" not in code
+    assert "attach-role-policy" not in code
+    assert "brd-architect-deploy-boundary" not in code

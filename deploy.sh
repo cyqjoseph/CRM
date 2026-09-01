@@ -96,6 +96,25 @@ sam deploy "${DEPLOY_ARGS[@]}" || { dump_stack_failures; exit 1; }
 aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
   --query "Stacks[0].Outputs" --output json > /tmp/"${STACK_NAME}"-outputs.json
 
+# --- Seed real inventory by invoking the discovery Lambdas once after deploy ---
+# discovery-iam-fn scans real IAM users/access keys — an allowed service with no
+# permissions-boundary restriction — so invoking it here guarantees iam-accounts
+# has data without waiting for the daily EventBridge schedule (DiscoveryScheduleRule).
+# discovery-acm-fn is invoked too: its ACM sub-scan is denied by the account's
+# permissions boundary (ACM is not in CLAUDE.md's allowed-services list), but each
+# discovery source degrades independently, so it still writes any Secrets-Manager-
+# tagged or IAM server certificates it finds on top of the simulated rows seeded
+# below. Neither invocation failing should fail the deploy — the schedule will
+# retry it on its own cadence.
+aws lambda invoke --function-name app-d9fae51c-1929cc69-discovery-iam-fn \
+  --region "$REGION" --cli-binary-format raw-in-base64-out --payload '{}' \
+  /tmp/discovery-iam-invoke.json \
+  || echo "warning: discovery-iam-fn invocation failed — iam-accounts may be empty until the next scheduled run" >&2
+aws lambda invoke --function-name app-d9fae51c-1929cc69-discovery-acm-fn \
+  --region "$REGION" --cli-binary-format raw-in-base64-out --payload '{}' \
+  /tmp/discovery-acm-invoke.json \
+  || echo "warning: discovery-acm-fn invocation failed — non-ACM cert sources may be empty until the next scheduled run" >&2
+
 # --- Seed simulated ACM certificates correlated to the 3 EC2 test instances ---
 # A real ACM certificate cannot be issued for an invented hostname like
 # "crm-test-1.internal.example.com" — public issuance requires DNS/email
