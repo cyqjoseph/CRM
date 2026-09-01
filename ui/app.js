@@ -132,6 +132,76 @@
     return body;
   }
 
+
+  // --- Step Functions execution polling ---
+
+  // Renew/Rotate return 202 the instant the state machine starts, so the click
+  // says nothing about whether the work succeeded. Every asynchronous failure
+  // (a boundary-denied API call, a missing row, a Lambda error) used to land
+  // only in the execution history, leaving the button stuck on "started" — which
+  // is indistinguishable from the button not working at all. Poll the execution
+  // to its terminal state and report it.
+  const POLL_INTERVAL_MS = 1500;
+  const POLL_MAX_ATTEMPTS = 20; // ~30s, well past these state machines' runtime
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  async function awaitExecution(executionArn) {
+    for (let attempt = 0; attempt < POLL_MAX_ATTEMPTS; attempt += 1) {
+      await sleep(POLL_INTERVAL_MS);
+      let result;
+      try {
+        result = await apiFetch(`/executions/${encodeURIComponent(executionArn)}`, { method: "GET" });
+      } catch (err) {
+        // A single failed poll is not a failed execution — keep trying, and only
+        // surface the error if we never get a terminal status.
+        continue;
+      }
+      if (result.status && result.status !== "RUNNING") return result;
+    }
+    return { status: "TIMED_OUT" };
+  }
+
+  // Drives one 202-returning action button through start -> poll -> outcome, and
+  // reloads the table on success so the row shows its new expiry/status.
+  async function runAsyncAction(button, path, labels, reload, errorFieldId) {
+    const original = button.textContent;
+    button.disabled = true;
+    button.textContent = labels.pending;
+    try {
+      const started = await apiFetch(path, { method: "POST" });
+      const outcome = await awaitExecution(started.executionArn);
+
+      if (outcome.status === "SUCCEEDED") {
+        button.textContent = labels.done;
+        await reload();
+        return;
+      }
+      if (outcome.status === "TIMED_OUT") {
+        button.textContent = original;
+        button.disabled = false;
+        setError(errorFieldId, `${labels.noun} is still running — refresh the tab to see the result.`);
+        return;
+      }
+      // FAILED / TIMED_OUT / ABORTED: name the state that failed if we have it.
+      const failedState = (outcome.events || []).find((e) => /Failed/.test(e.type));
+      setError(
+        errorFieldId,
+        `${labels.noun} failed (${outcome.status})` +
+          (failedState ? ` at ${failedState.type}` : "") +
+          ". Check the audit tab for details."
+      );
+      button.textContent = original;
+      button.disabled = false;
+    } catch (err) {
+      setError(errorFieldId, err.message);
+      button.textContent = original;
+      button.disabled = false;
+    }
+  }
+
   // --- Tabs ---
 
   document.querySelectorAll(".tab").forEach((btn) => {
@@ -180,15 +250,15 @@
     }
   }
 
-  async function renewCert(certId, button) {
-    button.disabled = true;
-    try {
-      await apiFetch(`/certs/${encodeURIComponent(certId)}/renew`, { method: "POST" });
-      button.textContent = "Renewal started";
-    } catch (err) {
-      setError("certsError", err.message);
-      button.disabled = false;
-    }
+  function renewCert(certId, button) {
+    setError("certsError", null);
+    return runAsyncAction(
+      button,
+      `/certs/${encodeURIComponent(certId)}/renew`,
+      { pending: "Renewing\u2026", done: "Renewed", noun: "Renewal" },
+      loadCerts,
+      "certsError"
+    );
   }
 
   // --- IAM accounts ---
@@ -223,15 +293,15 @@
     }
   }
 
-  async function rotateAccount(accountId, button) {
-    button.disabled = true;
-    try {
-      await apiFetch(`/iam/accounts/${encodeURIComponent(accountId)}/rotate`, { method: "POST" });
-      button.textContent = "Rotation started";
-    } catch (err) {
-      setError("iamError", err.message);
-      button.disabled = false;
-    }
+  function rotateAccount(accountId, button) {
+    setError("iamError", null);
+    return runAsyncAction(
+      button,
+      `/iam/accounts/${encodeURIComponent(accountId)}/rotate`,
+      { pending: "Rotating\u2026", done: "Rotated", noun: "Rotation" },
+      loadIamAccounts,
+      "iamError"
+    );
   }
 
   // --- Account detail modal + password reset requests ---

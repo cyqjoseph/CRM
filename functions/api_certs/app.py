@@ -1,4 +1,5 @@
 """api-certs-fn: GET /certs, GET /certs/{certId}, POST /certs/{certId}/renew."""
+import json
 import os
 import traceback
 
@@ -105,9 +106,7 @@ def _renew_cert(table, claims, cert_id, request_id):
         )
         return api_response(404, {"message": "not found"})
 
-    execution_input = '{"certId": "%s", "certArn": "%s", "requestId": "%s"}' % (
-        cert_id, item.get("CertId", cert_id), request_id,
-    )
+    execution_input = json.dumps({"certId": cert_id, "requestId": request_id})
     structured_log(
         request_id, "start_execution_attempt", function="api-certs",
         certId=cert_id, stateMachineArn=RENEWAL_STATE_MACHINE_ARN, input=execution_input,

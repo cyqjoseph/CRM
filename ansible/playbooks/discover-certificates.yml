@@ -1,8 +1,0 @@
-# STUB — non-functional. See ansible/README.md.
----
-- name: Discover on-prem ADCS certificates
-  hosts: adcs
-  gather_facts: false
-  roles:
-    - discover-certificates
-    - report-to-dynamodb

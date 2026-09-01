@@ -1,4 +1,5 @@
 """api-iam-fn: GET /iam/accounts, GET /iam/accounts/{accountId}, POST /iam/accounts/{accountId}/rotate."""
+import json
 import os
 import traceback
 
@@ -92,12 +93,28 @@ def _rotate_account(table, claims, account_id, request_id):
     if not is_admin(claims) and item.get("OwnerId") != owner_id_of(claims):
         return api_response(404, {"message": "not found"})
 
-    sfn = boto3.client("stepfunctions")
-    execution = sfn.start_execution(
-        stateMachineArn=ROTATION_STATE_MACHINE_ARN,
-        name=request_id,
-        input='{"accountIdHash": "%s", "requestId": "%s"}' % (account_id, request_id),
-    )
+    # Same isolated try/except as api-certs-fn's renew path: a StartExecution
+    # failure returns the exception message (e.g. an AccessDeniedException naming
+    # the missing action) rather than guard_api_handler's generic "internal
+    # error", which is otherwise indistinguishable in the browser from a 403.
+    try:
+        sfn = boto3.client("stepfunctions")
+        execution = sfn.start_execution(
+            stateMachineArn=ROTATION_STATE_MACHINE_ARN,
+            name=request_id,
+            input=json.dumps({"accountIdHash": account_id, "requestId": request_id}),
+        )
+    except Exception as error:
+        structured_log(
+            request_id, "start_execution_error", level="ERROR", function="api-iam",
+            statusCode=500, accountId=account_id, stateMachineArn=ROTATION_STATE_MACHINE_ARN,
+            error=str(error), errorType=type(error).__name__, stackTrace=traceback.format_exc(),
+        )
+        return api_response(500, {
+            "error": "Step Functions call failed",
+            "details": str(error),
+            "accountId": account_id,
+        })
 
     put_audit_event(
         entity_id=account_id,
@@ -111,7 +128,12 @@ def _rotate_account(table, claims, account_id, request_id):
         request_id, "rotation_started", function="api-iam",
         accountId=account_id, executionArn=execution["executionArn"],
     )
-    return api_response(202, {"executionArn": execution["executionArn"], "requestId": request_id})
+    return api_response(202, {
+        "executionArn": execution["executionArn"],
+        "accountId": account_id,
+        "status": "RUNNING",
+        "requestId": request_id,
+    })
 
 
 @guard_api_handler

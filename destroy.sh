@@ -12,7 +12,6 @@ OUTPUTS_FILE="outputs.json"
 # Every AWS::SecretsManager::Secret name in template.yaml. Kept in sync by
 # tests/test_scripts.py::test_both_scripts_cover_every_secret_in_the_template.
 SECRET_NAMES=(
-  "app-d9fae51c-1929cc69-test-instance-registry"
   "app-d9fae51c-1929cc69-jira-token"
   "app-d9fae51c-1929cc69-password-reset-credentials"
 )

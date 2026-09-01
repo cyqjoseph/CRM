@@ -32,7 +32,6 @@ def _without_comments(script: str) -> str:
 
 # The AWS::SecretsManager::Secret names in template.yaml.
 SECRET_NAMES = (
-    "app-d9fae51c-1929cc69-test-instance-registry",
     "app-d9fae51c-1929cc69-jira-token",
     "app-d9fae51c-1929cc69-password-reset-credentials",
 )
@@ -103,9 +102,7 @@ def test_deploy_invokes_both_discovery_lambdas_after_the_stack_is_up():
     assert code.count("aws lambda invoke") == 2
     # CLI v2 requires this for a blob (Payload) parameter passed as raw JSON.
     assert "--cli-binary-format raw-in-base64-out" in code
-    # A discovery Lambda failing (e.g. discovery-acm-fn's ACM sub-scan, which the
-    # account's permissions boundary denies since ACM isn't an allowed service)
-    # must never fail the whole deploy.
+    # A discovery Lambda failing must never fail the whole deploy.
     assert code.index("sam deploy") < code.index("discovery-iam-fn"), (
         "the discovery Lambdas must be invoked after the stack exists"
     )

@@ -165,7 +165,48 @@ DETAIL_STATUS="$(curl -s -o /dev/null -w '%{http_code}' \
 [ "$DETAIL_STATUS" = "200" ] || fail "GET /certs/$SEEDED_CERT_ID -> $DETAIL_STATUS"
 pass "GET /certs/$SEEDED_CERT_ID -> 200"
 
-step "8. Clean up"
+step "8. Renew the seeded cert (the full async path)"
+# This is the check that would have caught the boundary-denied ACM call: the POST
+# returns 202 whether or not the state machine can actually do the work, so the
+# only honest test is to poll the execution to a terminal state.
+RENEW_JSON="$(curl -s -X POST "$API_URL/certs/$SEEDED_CERT_ID/renew" \
+  -H "Authorization: $ID_TOKEN")"
+
+EXECUTION_ARN="$(printf '%s' "$RENEW_JSON" | jq -r '.executionArn // empty')"
+[ -n "$EXECUTION_ARN" ] \
+  || fail "POST /certs/$SEEDED_CERT_ID/renew returned no executionArn: $RENEW_JSON
+       A \"Step Functions call failed\" error here names the denied action."
+pass "POST /certs/$SEEDED_CERT_ID/renew -> 202 ($EXECUTION_ARN)"
+
+# The renewal state machine settles in a couple of seconds; poll rather than sleep.
+EXECUTION_STATUS="RUNNING"
+for _ in $(seq 1 20); do
+  sleep 2
+  EXECUTION_JSON="$(curl -s "$API_URL/executions/$EXECUTION_ARN" -H "Authorization: $ID_TOKEN")"
+  EXECUTION_STATUS="$(printf '%s' "$EXECUTION_JSON" | jq -r '.status // "UNKNOWN"')"
+  [ "$EXECUTION_STATUS" = "RUNNING" ] || break
+done
+
+case "$EXECUTION_STATUS" in
+  SUCCEEDED) pass "renewal execution SUCCEEDED" ;;
+  RUNNING)   fail "renewal execution still RUNNING after 40s: $EXECUTION_ARN" ;;
+  *)         fail "renewal execution $EXECUTION_STATUS — the renew button will
+       silently do nothing. Inspect the failing state:
+         aws stepfunctions get-execution-history --execution-arn $EXECUTION_ARN \\
+           --region $REGION --reverse-order --max-items 10
+       Response was: $EXECUTION_JSON" ;;
+esac
+
+# Renewal writes a new ExpiryDate; if the row did not move, the executor ran but
+# wrote nothing — a silent success that looks identical to a working renewal.
+RENEWED_EXPIRY="$(curl -s "$API_URL/certs/$SEEDED_CERT_ID" -H "Authorization: $ID_TOKEN" \
+  | jq -r '.ExpiryDate // empty')"
+[ -n "$RENEWED_EXPIRY" ] && [ "$RENEWED_EXPIRY" != "$EXPIRY" ] \
+  || fail "ExpiryDate is still $EXPIRY after a SUCCEEDED renewal — the executor
+       reported success without writing to cert-inventory"
+pass "ExpiryDate moved $EXPIRY -> $RENEWED_EXPIRY"
+
+step "9. Clean up"
 aws dynamodb delete-item --table-name "$CERT_TABLE" --region "$REGION" \
   --key "{\"CertId\": {\"S\": \"$SEEDED_CERT_ID\"}}"
 pass "removed $SEEDED_CERT_ID"
@@ -180,7 +221,10 @@ To see it in the browser, open $APP_URL and sign in as:
   email:    $TEST_EMAIL
   password: $TEST_PASSWORD
 
-The Certificates tab will be empty — that is correct on a fresh account. Re-run
-this script's step 7 (or seed your own row) with OwnerId set to your own
-Cognito sub to make rows appear for your own login.
+The Certificates tab shows whatever rows carry your own Cognito sub as OwnerId.
+Discovery derives OwnerId from an IAM path or a resource tag, not from a Cognito
+sub, so genuinely discovered rows appear in nobody's UI — an empty tab is the
+normal state on a fresh login, not a fault. deploy.sh seeds demo rows against
+SEED_OWNER_ID; set it to your own sub and redeploy, or re-run this script's step
+7 by hand, to make rows appear for your login.
 EOF

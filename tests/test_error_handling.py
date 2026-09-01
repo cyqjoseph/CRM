@@ -23,7 +23,6 @@ API_MODULES = {
     "certs": ("api_certs_err", "functions/api_certs/app.py"),
     "iam": ("api_iam_err", "functions/api_iam/app.py"),
     "audit": ("api_audit_err", "functions/api_audit/app.py"),
-    "sync": ("sync_on_prem_err", "functions/sync_on_prem/app.py"),
     "password_resets": ("api_password_resets_err", "functions/api_password_resets/app.py"),
     "password_reset_approver": ("password_reset_approver_err", "functions/password_reset_approver/app.py"),
 }
@@ -32,7 +31,6 @@ EVENTS = {
     "certs": {"httpMethod": "GET", "resource": "/certs"},
     "iam": {"httpMethod": "GET", "resource": "/iam/accounts"},
     "audit": {"httpMethod": "GET", "resource": "/audit"},
-    "sync": {"httpMethod": "POST", "resource": "/sync/on-prem-data"},
     "password_resets": {"httpMethod": "POST", "resource": "/password-resets"},
     "password_reset_approver": {"httpMethod": "POST", "resource": "/password-resets/{requestId}/approve"},
 }
@@ -44,8 +42,6 @@ def _event(name):
     event["queryStringParameters"] = {"entityId": "owner-1"} if name == "audit" else None
     claims = {"sub": "admin-1", "cognito:groups": "admins"} if name == "password_reset_approver" else {"sub": "owner-1"}
     event["requestContext"] = {"authorizer": {"claims": claims}}
-    if name == "sync":
-        event["body"] = json.dumps({"table": "certificates", "item": {"CertId": "x"}})
     if name == "password_resets":
         event["body"] = json.dumps({"accountId": "hash-1"})
     return event

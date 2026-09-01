@@ -43,7 +43,6 @@ REQUIRED_ROUTES = {
     ("/iam/accounts", "get"),
     ("/iam/accounts/{accountId}", "get"),
     ("/iam/accounts/{accountId}/rotate", "post"),
-    ("/sync/on-prem-data", "post"),
     ("/executions/{executionId}", "get"),
     ("/audit", "get"),
     ("/password-resets", "post"),
@@ -55,12 +54,12 @@ REQUIRED_ROUTES = {
 
 # Actions that AWS's IAM Service Authorization Reference documents as NOT
 # supporting resource-level permissions at all — a wildcard Resource is the
-# only valid value for these, not a scoping gap. The 5 CloudWatch Logs actions
-# are here for a different reason: Lambda's own execution environment calls
-# them (to create its log group/stream) before that log group exists, so even
-# a correctly-scoped ARN would deny the very first invocation.
+# only valid value for these, not a scoping gap. The CloudWatch Logs and X-Ray
+# actions are here for a different reason: each is called before the resource it
+# would be scoped to exists (a log group is created by the function's own first
+# invocation, a trace segment by the call that emits it), so even a
+# correctly-scoped ARN would deny that first call.
 MANDATORY_WILDCARD_ACTIONS = {
-    "acm:ListCertificates",
     "secretsmanager:ListSecrets",
     "iam:ListServerCertificates",
     "iam:ListUsers",
@@ -70,6 +69,14 @@ MANDATORY_WILDCARD_ACTIONS = {
     "logs:PutLogEvents",
     "logs:DescribeLogGroups",
     "logs:DescribeLogStreams",
+    # X-Ray's write/sampling actions accept no resource ARN at all — the trace
+    # does not exist yet when PutTraceSegments is called, and the sampling rules
+    # are account-level. Needed on each state machine role because they supply
+    # their own Role, so SAM injects no X-Ray grant of its own.
+    "xray:PutTraceSegments",
+    "xray:PutTelemetryRecords",
+    "xray:GetSamplingRules",
+    "xray:GetSamplingTargets",
 }
 
 
@@ -252,3 +259,91 @@ def test_ssm_parameters_live_under_the_mandated_path():
             continue
         name = resource["Properties"]["Name"]
         assert name.startswith(path_prefix), f"{logical_id}.Name = {name!r}"
+
+
+# ---------------------------------------------------------------------------
+# Permissions regressions
+# ---------------------------------------------------------------------------
+
+SFN_ROLES = (
+    "DiscoverySfnRole",
+    "RenewalSfnRole",
+    "RotationSfnRole",
+    "PasswordResetSfnRole",
+)
+
+
+def test_no_acm_permissions_anywhere_in_the_template():
+    """ACM is absent from CLAUDE.md's allowed-services list, so the account
+    permissions boundary denies acm:* no matter what a role grants.
+
+    Granting it anyway is worse than useless: the deploy succeeds, the call
+    fails at runtime deep inside a state machine, and the AccessDeniedException
+    only reaches the execution history. That is exactly how the Renew button
+    came to return 202 and then do nothing.
+    """
+    offenders = []
+    for logical_id, statement in _iter_statements():
+        actions = statement["Action"]
+        actions = [actions] if isinstance(actions, str) else actions
+        for action in actions:
+            if isinstance(action, str) and action.startswith("acm:"):
+                offenders.append(f"{logical_id}: {action}")
+    assert not offenders, (
+        "these grants can never take effect — the permissions boundary denies "
+        "ACM. Do not add the permission; remove the call.\n" + "\n".join(offenders)
+    )
+
+
+def test_every_state_machine_role_can_actually_write_xray_traces():
+    """Each state machine sets Tracing.Enabled: true AND supplies its own Role.
+
+    SAM only injects X-Ray permissions into a role it generates itself, so a
+    custom Role leaves tracing enabled but unauthorised — it fails silently, with
+    no trace and no error anywhere.
+    """
+    required = {
+        "xray:PutTraceSegments",
+        "xray:PutTelemetryRecords",
+        "xray:GetSamplingRules",
+        "xray:GetSamplingTargets",
+    }
+    for logical_id in SFN_ROLES:
+        granted = set()
+        for policy in RESOURCES[logical_id]["Properties"]["Policies"]:
+            for statement in policy["PolicyDocument"]["Statement"]:
+                actions = statement["Action"]
+                granted.update([actions] if isinstance(actions, str) else actions)
+        missing = required - granted
+        assert not missing, f"{logical_id} enables tracing but cannot write it: {missing}"
+
+
+def test_api_audit_can_describe_every_state_machine_it_is_asked_about():
+    """GET /executions/{executionId} is the UI's only way to learn whether a
+    renew/rotate/password-reset actually succeeded.
+
+    PasswordResetSfn was missing from this grant, so polling an approved reset
+    returned AccessDenied — indistinguishable in the browser from the execution
+    itself having failed.
+    """
+    statements = [
+        statement
+        for logical_id, statement in _iter_statements()
+        if logical_id == "ApiAuditFunction"
+    ]
+    described = []
+    for statement in statements:
+        actions = statement["Action"]
+        actions = [actions] if isinstance(actions, str) else actions
+        if not any(a.startswith("states:") for a in actions):
+            continue
+        resources = statement["Resource"]
+        resources = [resources] if isinstance(resources, dict) else resources
+        described.extend(str(r) for r in resources)
+
+    joined = " ".join(described)
+    for name in ("DiscoverySfn", "RenewalSfn", "RotationSfn", "PasswordResetSfn"):
+        assert f"${{{name}.Name}}" in joined, (
+            f"api-audit-fn cannot DescribeExecution on {name} — polling one of its "
+            "executions returns AccessDenied, which looks like a failed execution"
+        )

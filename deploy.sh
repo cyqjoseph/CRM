@@ -12,7 +12,6 @@ OUTPUTS_FILE="outputs.json"
 # Every AWS::SecretsManager::Secret name in template.yaml. Kept in sync by
 # tests/test_scripts.py::test_both_scripts_cover_every_secret_in_the_template.
 SECRET_NAMES=(
-  "app-d9fae51c-1929cc69-test-instance-registry"
   "app-d9fae51c-1929cc69-jira-token"
   "app-d9fae51c-1929cc69-password-reset-credentials"
 )
@@ -96,16 +95,11 @@ sam deploy "${DEPLOY_ARGS[@]}" || { dump_stack_failures; exit 1; }
 aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
   --query "Stacks[0].Outputs" --output json > /tmp/"${STACK_NAME}"-outputs.json
 
-# --- Seed real inventory by invoking the discovery Lambdas once after deploy ---
-# discovery-iam-fn scans real IAM users/access keys — an allowed service with no
-# permissions-boundary restriction — so invoking it here guarantees iam-accounts
-# has data without waiting for the daily EventBridge schedule (DiscoveryScheduleRule).
-# discovery-acm-fn is invoked too: its ACM sub-scan is denied by the account's
-# permissions boundary (ACM is not in CLAUDE.md's allowed-services list), but each
-# discovery source degrades independently, so it still writes any Secrets-Manager-
-# tagged or IAM server certificates it finds on top of the simulated rows seeded
-# below. Neither invocation failing should fail the deploy — the schedule will
-# retry it on its own cadence.
+# --- Populate real inventory by invoking the discovery Lambdas once after deploy ---
+# Both scan services the boundary permits (IAM users/access keys, IAM server
+# certificates, tagged Secrets Manager entries), so this gives the tables real
+# data immediately instead of waiting for the daily DiscoveryScheduleRule.
+# Neither invocation failing should fail the deploy — the schedule retries.
 aws lambda invoke --function-name app-d9fae51c-1929cc69-discovery-iam-fn \
   --region "$REGION" --cli-binary-format raw-in-base64-out --payload '{}' \
   /tmp/discovery-iam-invoke.json \
@@ -113,51 +107,39 @@ aws lambda invoke --function-name app-d9fae51c-1929cc69-discovery-iam-fn \
 aws lambda invoke --function-name app-d9fae51c-1929cc69-discovery-acm-fn \
   --region "$REGION" --cli-binary-format raw-in-base64-out --payload '{}' \
   /tmp/discovery-acm-invoke.json \
-  || echo "warning: discovery-acm-fn invocation failed — non-ACM cert sources may be empty until the next scheduled run" >&2
+  || echo "warning: discovery-acm-fn invocation failed — cert-inventory may be empty until the next scheduled run" >&2
 
-# --- Seed simulated ACM certificates correlated to the 3 EC2 test instances ---
-# A real ACM certificate cannot be issued for an invented hostname like
-# "crm-test-1.internal.example.com" — public issuance requires DNS/email
-# domain-ownership validation, which this project has no real zone for. These
-# rows simulate that inventory directly, correlated by instance id, so the UI's
-# certificate dashboard has real EC2-backed data to show end to end.
+# --- Seed demo inventory rows the UI can render and act on ---------------------
+# Discovery and the API disagree about what OwnerId means: discovery derives it
+# from an IAM path or a resource tag, while GET /certs and GET /iam/accounts
+# query OwnerIndex with the caller's Cognito `sub`. So genuinely discovered rows
+# belong to no human login and appear in nobody's UI. These rows are written
+# against a known sub so the dashboard has something to show and every control
+# (Renew, Rotate, Details, Request Password Reset) can be exercised end to end.
+#
+# Override with SEED_OWNER_ID=<your-cognito-sub> ./deploy.sh to target a
+# different login; find yours in the Cognito console, or in any api-certs-fn log
+# line's `ownerId` field after signing in once.
+#
+# Field names matter and are easy to get wrong:
+#   - ExpiryDate / NextRotationDate are OwnerIndex's RANGE key on their table.
+#     DynamoDB accepts a row without one and then silently omits it from the
+#     index, so GET /certs would never return it.
+#   - The UI renders `Status` (not `RotationStatus`) and `UserName` on the IAM
+#     tab, and rotation.asl.json writes back to `Status`.
+# Dates are computed relative to now, not hardcoded — a fixed date silently ages
+# into the past and makes every row render as long expired.
+SEED_OWNER_ID="${SEED_OWNER_ID:-d9ca551c-d0a1-7011-1c4f-99a48c8d917f}"
+
 CERT_TABLE="$(jq -r '.[] | select(.OutputKey=="CertInventoryTableName") | .OutputValue' /tmp/"${STACK_NAME}"-outputs.json)"
 IAM_TABLE="$(jq -r '.[] | select(.OutputKey=="IamAccountsTableName") | .OutputValue' /tmp/"${STACK_NAME}"-outputs.json)"
-for i in 1 2 3; do
-  INSTANCE_ID="$(jq -r ".[] | select(.OutputKey==\"TestInstance${i}Id\") | .OutputValue" /tmp/"${STACK_NAME}"-outputs.json)"
-  DOMAIN="crm-test-${i}.internal.example.com"
-  NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  EXPIRY_ISO="$(date -u -d "+90 days" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+90d +%Y-%m-%dT%H:%M:%SZ)"
 
-  aws dynamodb put-item \
-    --table-name "$CERT_TABLE" --region "$REGION" \
-    --item "{
-      \"CertId\": {\"S\": \"sim-cert-crm-test-${i}\"},
-      \"CertType\": {\"S\": \"SIMULATED_ACM\"},
-      \"OwnerId\": {\"S\": \"${DOMAIN}\"},
-      \"Domain\": {\"S\": \"${DOMAIN}\"},
-      \"ExpiryDate\": {\"S\": \"${EXPIRY_ISO}\"},
-      \"Status\": {\"S\": \"ISSUED\"},
-      \"Source\": {\"S\": \"AWS_ACM\"},
-      \"EnvironmentTag\": {\"S\": \"aws\"},
-      \"LastSyncedAt\": {\"S\": \"${NOW_ISO}\"},
-      \"InstanceId\": {\"S\": \"${INSTANCE_ID}\"},
-      \"Version\": {\"N\": \"1\"}
-    }"
-done
+_in_days() {
+  date -u -d "+$1 days" +%Y-%m-%d 2>/dev/null || date -u -v"+$1"d +%Y-%m-%d
+}
 
-# --- WORKAROUND: seed fixed test data into cert-inventory/iam-accounts -------
-# The discovery Lambdas can't yet be exercised end to end here (see README's
-# Deviations section), so this writes a known, fixed set of rows directly —
-# same `dynamodb put-item` mechanism as the simulated ACM certs above — so the
-# UI's Certificates/IAM Accounts tabs and the DynamoDB -> API Lambda -> API
-# Gateway -> Frontend path all have real data to render immediately. This is
-# temporary; real discovery populates these tables once it is fully wired up.
-# `put-item` is itself idempotent (an unconditional upsert), and a failure
-# here must never abort an otherwise-successful deploy — same convention as
-# the discovery Lambda invocations above.
-TEST_OWNER_ID="d9ca551c-d0a1-7011-1c4f-99a48c8d917f"
-
+# `put-item` is an unconditional upsert, so re-running deploy.sh is idempotent.
+# A seed failure must never abort an otherwise-successful deploy.
 seed_item() {
   local table="$1" item="$2" label="$3"
   if aws dynamodb put-item --table-name "$table" --region "$REGION" --item "$item"; then
@@ -167,73 +149,48 @@ seed_item() {
   fi
 }
 
-seed_item "$CERT_TABLE" "$(cat <<EOF
+# Expiry offsets deliberately span all three bands the UI colours:
+#   <= 7 days -> red    <= 30 days -> amber    else green
+# id|domain|days-to-expiry|type
+for row in \
+  "cert-001|payments.internal.example.com|3|ACM" \
+  "cert-002|sso.internal.example.com|21|Self-Signed" \
+  "cert-003|api.internal.example.com|75|On-Prem"
+do
+  IFS='|' read -r cert_id domain days cert_type <<<"$row"
+  seed_item "$CERT_TABLE" "$(cat <<EOF
 {
-  "CertId":      {"S": "cert-001"},
-  "CertType":    {"S": "ACM"},
-  "OwnerId":     {"S": "${TEST_OWNER_ID}"},
-  "ExpiryDate":  {"S": "2025-12-31T23:59:59Z"},
-  "Status":      {"S": "active"},
-  "Source":      {"S": "ACM"},
-  "CreatedAt":   {"S": "2026-01-01T00:00:00Z"},
-  "Description": {"S": "Test ACM Certificate 1"}
+  "CertId":      {"S": "${cert_id}"},
+  "CertType":    {"S": "${cert_type}"},
+  "OwnerId":     {"S": "${SEED_OWNER_ID}"},
+  "Domain":      {"S": "${domain}"},
+  "ExpiryDate":  {"S": "$(_in_days "$days")"},
+  "Status":      {"S": "ISSUED"},
+  "Source":      {"S": "seed"},
+  "Version":     {"N": "$(date +%s)"}
 }
 EOF
-)" "cert-001"
+)" "$cert_id"
+done
 
-seed_item "$CERT_TABLE" "$(cat <<EOF
+# id|username|days-to-next-rotation|status
+for row in \
+  "hash-acct-001|svc-payments|4|warning" \
+  "hash-acct-002|svc-reporting|45|active"
+do
+  IFS='|' read -r account_hash user_name days status <<<"$row"
+  seed_item "$IAM_TABLE" "$(cat <<EOF
 {
-  "CertId":      {"S": "cert-002"},
-  "CertType":    {"S": "Self-Signed"},
-  "OwnerId":     {"S": "${TEST_OWNER_ID}"},
-  "ExpiryDate":  {"S": "2025-06-30T23:59:59Z"},
-  "Status":      {"S": "warning"},
-  "Source":      {"S": "Manual"},
-  "CreatedAt":   {"S": "2026-01-01T00:00:00Z"},
-  "Description": {"S": "Test Self-Signed Certificate"}
+  "AccountIdHash":    {"S": "${account_hash}"},
+  "UserName":         {"S": "${user_name}"},
+  "OwnerId":          {"S": "${SEED_OWNER_ID}"},
+  "NextRotationDate": {"S": "$(_in_days "$days")"},
+  "Status":           {"S": "${status}"},
+  "Source":           {"S": "seed"}
 }
 EOF
-)" "cert-002"
-
-seed_item "$CERT_TABLE" "$(cat <<EOF
-{
-  "CertId":      {"S": "cert-003"},
-  "CertType":    {"S": "On-Prem"},
-  "OwnerId":     {"S": "${TEST_OWNER_ID}"},
-  "ExpiryDate":  {"S": "2025-03-15T23:59:59Z"},
-  "Status":      {"S": "critical"},
-  "Source":      {"S": "Internal"},
-  "CreatedAt":   {"S": "2026-01-01T00:00:00Z"},
-  "Description": {"S": "Test On-Prem Certificate"}
-}
-EOF
-)" "cert-003"
-
-seed_item "$IAM_TABLE" "$(cat <<EOF
-{
-  "AccountIdHash":    {"S": "hash-acct-001"},
-  "OwnerId":          {"S": "${TEST_OWNER_ID}"},
-  "Domain":           {"S": "example.com"},
-  "NextRotationDate": {"S": "2025-12-15T00:00:00Z"},
-  "RotationStatus":   {"S": "pending"},
-  "CreatedAt":        {"S": "2026-01-01T00:00:00Z"},
-  "AccountName":      {"S": "Example Corp IAM Account"}
-}
-EOF
-)" "hash-acct-001"
-
-seed_item "$IAM_TABLE" "$(cat <<EOF
-{
-  "AccountIdHash":    {"S": "hash-acct-002"},
-  "OwnerId":          {"S": "${TEST_OWNER_ID}"},
-  "Domain":           {"S": "internal.local"},
-  "NextRotationDate": {"S": "2025-09-30T00:00:00Z"},
-  "RotationStatus":   {"S": "overdue"},
-  "CreatedAt":        {"S": "2026-01-01T00:00:00Z"},
-  "AccountName":      {"S": "Internal IAM Account"}
-}
-EOF
-)" "hash-acct-002"
+)" "$account_hash"
+done
 
 # --- Sync the static self-service UI to S3 and invalidate the CloudFront cache ---
 if [ -d "ui" ]; then

@@ -1,7 +1,13 @@
-"""discovery-acm-fn: scans ACM/Secrets Manager/IAM for certificate metadata.
+"""discovery-certs-fn: scans IAM server certificates and Secrets Manager for
+certificate metadata.
 
 Writes ONLY lifecycle metadata to the cert inventory table. Must never persist
 plaintext certificate or private key material (Requirement 1.4).
+
+Does NOT scan ACM. ACM is absent from CLAUDE.md's exhaustive allowed-services
+list, so the account permissions boundary denies acm:ListCertificates no matter
+what this function's own role grants — the branch could only ever log
+AccessDeniedException once per run. See README.md's Deviations section.
 """
 import os
 import time
@@ -35,43 +41,6 @@ ALLOWED_FIELDS = {
 
 def _sanitize(item):
     return {k: v for k, v in item.items() if k in ALLOWED_FIELDS}
-
-
-def _discover_acm_certs(acm_client, request_id):
-    items = []
-    paginator = acm_client.get_paginator("list_certificates")
-    for page in paginator.paginate():
-        summaries = page.get("CertificateSummaryList", [])
-        structured_log(request_id, "ACM_LIST_PAGE", source="acm", count=len(summaries))
-        for summary in summaries:
-            arn = summary["CertificateArn"]
-            try:
-                detail = acm_client.describe_certificate(CertificateArn=arn)
-            except Exception as exc:
-                structured_log(request_id, "ACM_DESCRIBE_FAILED", level="ERROR", source="acm", certArn=arn, error=str(exc))
-                continue
-            cert = detail["Certificate"]
-            structured_log(
-                request_id,
-                "ACM_DESCRIBE_OK",
-                source="acm",
-                certArn=arn,
-                domain=cert.get("DomainName"),
-                status=cert.get("Status"),
-            )
-            items.append(
-                {
-                    "CertId": cert["CertificateArn"],
-                    "CertType": "ACM",
-                    "OwnerId": cert.get("DomainName", "unknown"),
-                    "Domain": cert.get("DomainName", ""),
-                    "ExpiryDate": cert.get("NotAfter").isoformat() if cert.get("NotAfter") else None,
-                    "Status": cert.get("Status", "UNKNOWN"),
-                    "Source": "acm",
-                    "EnvironmentTag": "aws",
-                }
-            )
-    return items
 
 
 def _discover_iam_server_certs(iam_client, request_id):
@@ -124,7 +93,6 @@ def _discover_secrets_manager_certs(secretsmanager_client, request_id):
 
 # (discovery function, client key, human-readable source name)
 _DISCOVERERS = (
-    (_discover_acm_certs, "acm", "acm"),
     (_discover_iam_server_certs, "iam", "iam"),
     (_discover_secrets_manager_certs, "secretsmanager", "secretsmanager"),
 )
@@ -139,10 +107,9 @@ def _is_conditional_check_failure(exc):
 
 def handler(event, context):
     request_id = getattr(context, "aws_request_id", "local")
-    structured_log(request_id, "DISCOVERY_ACM_START")
+    structured_log(request_id, "DISCOVERY_CERTS_START")
 
     clients = {
-        "acm": boto3.client("acm"),
         "iam": boto3.client("iam"),
         "secretsmanager": boto3.client("secretsmanager"),
     }
@@ -194,7 +161,7 @@ def handler(event, context):
 
     structured_log(
         request_id,
-        "DISCOVERY_ACM_COMPLETE",
+        "DISCOVERY_CERTS_COMPLETE",
         discovered=len(discovered),
         written=written,
         skipped=skipped,

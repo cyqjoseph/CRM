@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Resolves the stack's CloudFormation outputs into shell variables.
 #
-# Sourced by scripts/validate.sh and scripts/seed.sh. Not meant to be run.
+# Sourced by scripts/validate.sh. Not meant to be run directly.
 #
 # Prefers the repo-root outputs.json that ./deploy.sh writes, but falls back to
 # querying CloudFormation directly. The fallback is the normal path here, not an
@@ -80,5 +80,4 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   printf '  USER_POOL_CLIENT_ID  %s\n' "$USER_POOL_CLIENT_ID"
   printf '\nThis file is a library — source it, or run:\n'
   printf '  ./scripts/validate.sh\n'
-  printf '  ./scripts/seed.sh <email>\n'
 fi

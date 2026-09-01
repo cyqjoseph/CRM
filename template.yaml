@@ -7,23 +7,10 @@ Description: >
   requirements/design.
 
 Parameters:
-  VpcId:
-    Type: AWS::EC2::VPC::Id
-    Default: vpc-01d3b02b0f1c07aa0
-    Description: Existing account default VPC (per platform contract — never create a new one).
-  SubnetIds:
-    Type: List<AWS::EC2::Subnet::Id>
-    Default: "subnet-0f43b5569d97d4bda,subnet-0f0834e47e6db3a6d,subnet-07a510b42806744f0"
-    Description: Existing public subnets (per platform contract — no NAT Gateway in this account).
   JiraBaseUrl:
     Type: String
     Default: https://example.atlassian.net
     Description: Base URL of the Jira Cloud instance tickets are created in.
-  LatestAmiId:
-    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
-    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
-    Description: Current Amazon Linux 2023 AMI, resolved at deploy time — never a hardcoded AMI id.
-
 Globals:
   Function:
     Runtime: python3.13
@@ -427,11 +414,6 @@ Resources:
     Properties:
       TopicName: app-d9fae51c-1929cc69-password-reset-notifications
 
-  OpsAlarmsTopic:
-    Type: AWS::SNS::Topic
-    Properties:
-      TopicName: app-d9fae51c-1929cc69-ops-alarms
-
   JiraDlq:
     Type: AWS::SQS::Queue
     Properties:
@@ -466,25 +448,6 @@ Resources:
       Name: app-d9fae51c-1929cc69-password-reset-credentials
       Description: Hashes + metadata of generated temporary reset passwords, keyed by RequestId. Never contains a plaintext password.
       SecretString: "{}"
-
-  # Registry of the simulated EC2 test instances + the (simulated) certificate
-  # identifiers correlated to them. This has a real dependency on the three
-  # instances below (via !Sub), so CloudFormation creates it AFTER them —
-  # unlike JiraTokenSecret, it is not in the first creation wave, and does not
-  # need to be part of that cancellation-cascade failure mode. It still needs
-  # the same scheduled-deletion purge handling in deploy.sh/destroy.sh, since
-  # nothing else about Secrets Manager's recovery window changes.
-  TestInstanceRegistrySecret:
-    Type: AWS::SecretsManager::Secret
-    Properties:
-      Name: app-d9fae51c-1929cc69-test-instance-registry
-      Description: Registry of simulated EC2 test instances and their correlated simulated certificate ids.
-      SecretString: !Sub |
-        {"instances":[
-          {"name":"crm-test-1","instanceId":"${TestInstance1}","hostname":"crm-test-1.internal.example.com","certId":"sim-cert-crm-test-1"},
-          {"name":"crm-test-2","instanceId":"${TestInstance2}","hostname":"crm-test-2.internal.example.com","certId":"sim-cert-crm-test-2"},
-          {"name":"crm-test-3","instanceId":"${TestInstance3}","hostname":"crm-test-3.internal.example.com","certId":"sim-cert-crm-test-3"}
-        ]}
 
   ThresholdLowParam:
     Type: AWS::SSM::Parameter
@@ -522,72 +485,6 @@ Resources:
       Value: "90"
 
   # ---------------------------------------------------------------------------
-  # EC2: simulated on-prem-like test instances, each with a simulated cert
-  # ---------------------------------------------------------------------------
-  # These stand in for real ACM certificates on real hosts. A genuine ACM
-  # certificate cannot be issued for an invented hostname like
-  # "crm-test-1.internal.example.com" — public ACM issuance requires DNS or
-  # email domain-ownership validation, and Route 53 / a real DNS zone for this
-  # domain is not part of this project. The certificate rows below are
-  # therefore simulated inventory metadata (written by deploy.sh), correlated
-  # to these real EC2 instances by instance id, not real acm:RequestCertificate
-  # calls. See README.md's Deviations section.
-  TestInstanceSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupName: app-d9fae51c-1929cc69-test-instance-sg
-      GroupDescription: Egress-only security group for the simulated EC2 test instances (no inbound needed).
-      VpcId: !Ref VpcId
-      SecurityGroupEgress:
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          CidrIp: 0.0.0.0/0
-          Description: AWS API calls (SSM agent, if attached later)
-
-  TestInstance1:
-    Type: AWS::EC2::Instance
-    Properties:
-      ImageId: !Ref LatestAmiId
-      InstanceType: t3.micro
-      SubnetId: !Select [0, !Ref SubnetIds]
-      SecurityGroupIds:
-        - !GetAtt TestInstanceSecurityGroup.GroupId
-      Tags:
-        - Key: Name
-          Value: app-d9fae51c-1929cc69-test-instance-1
-        - Key: crm-tracked-instance
-          Value: "true"
-
-  TestInstance2:
-    Type: AWS::EC2::Instance
-    Properties:
-      ImageId: !Ref LatestAmiId
-      InstanceType: t3.micro
-      SubnetId: !Select [1, !Ref SubnetIds]
-      SecurityGroupIds:
-        - !GetAtt TestInstanceSecurityGroup.GroupId
-      Tags:
-        - Key: Name
-          Value: app-d9fae51c-1929cc69-test-instance-2
-        - Key: crm-tracked-instance
-          Value: "true"
-
-  TestInstance3:
-    Type: AWS::EC2::Instance
-    Properties:
-      ImageId: !Ref LatestAmiId
-      InstanceType: t3.micro
-      SubnetId: !Select [2, !Ref SubnetIds]
-      SecurityGroupIds:
-        - !GetAtt TestInstanceSecurityGroup.GroupId
-      Tags:
-        - Key: Name
-          Value: app-d9fae51c-1929cc69-test-instance-3
-        - Key: crm-tracked-instance
-          Value: "true"
-
-  # ---------------------------------------------------------------------------
   # Lambda functions
   # ---------------------------------------------------------------------------
   DiscoveryAcmFunction:
@@ -602,18 +499,15 @@ Resources:
       Policies:
         - DynamoDBWritePolicy:
             TableName: !Ref CertInventoryTable
+        # No acm:* here on purpose. ACM is not in CLAUDE.md's allowed-services
+        # list, so the account permissions boundary denies it whatever this role
+        # grants — see functions/discovery_acm/app.py.
         - Statement:
             - Effect: Allow
               Action:
-                - acm:ListCertificates
                 - secretsmanager:ListSecrets
                 - iam:ListServerCertificates
               Resource: "*"
-        - Statement:
-            - Effect: Allow
-              Action:
-                - acm:DescribeCertificate
-              Resource: !Sub "arn:aws:acm:${AWS::Region}:${AWS::AccountId}:certificate/*"
         - Statement:
             - Effect: Allow
               Action:
@@ -704,12 +598,6 @@ Resources:
       Policies:
         - DynamoDBWritePolicy:
             TableName: !Ref CertInventoryTable
-        - Statement:
-            - Effect: Allow
-              Action:
-                - acm:RenewCertificate
-                - acm:DescribeCertificate
-              Resource: !Sub "arn:aws:acm:${AWS::Region}:${AWS::AccountId}:certificate/*"
         - Statement:
             - Effect: Allow
               Action:
@@ -894,6 +782,7 @@ Resources:
                 - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${DiscoverySfn.Name}:*"
                 - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${RenewalSfn.Name}:*"
                 - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${RotationSfn.Name}:*"
+                - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${PasswordResetSfn.Name}:*"
         - Statement:
             - Effect: Allow
               Action:
@@ -1069,42 +958,6 @@ Resources:
                 - logs:DescribeLogStreams
               Resource: "*"
 
-  # Stub proxy for future on-prem (Ansible-driven) inventory sync. Passes the
-  # request body straight through to DynamoDB with no validation — see
-  # ansible/README.md and the TODO in functions/sync_on_prem/app.py. Not
-  # wired to any real on-prem system; nothing today calls this route.
-  SyncOnPremFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: app-d9fae51c-1929cc69-sync-on-prem-fn
-      CodeUri: functions/sync_on_prem/
-      Handler: app.handler
-      Environment:
-        Variables:
-          CERT_TABLE_NAME: !Ref CertInventoryTable
-          IAM_TABLE_NAME: !Ref IamAccountsTable
-      Policies:
-        - DynamoDBWritePolicy:
-            TableName: !Ref CertInventoryTable
-        - DynamoDBWritePolicy:
-            TableName: !Ref IamAccountsTable
-        - Statement:
-            - Effect: Allow
-              Action:
-                - logs:CreateLogGroup
-                - logs:CreateLogStream
-                - logs:PutLogEvents
-                - logs:DescribeLogGroups
-                - logs:DescribeLogStreams
-              Resource: "*"
-      Events:
-        SyncOnPremData:
-          Type: Api
-          Properties:
-            RestApiId: !Ref CrmApi
-            Path: /sync/on-prem-data
-            Method: post
-
   AuditExporterFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -1162,6 +1015,13 @@ Resources:
               - Effect: Allow
                 Action: dynamodb:PutItem
                 Resource: !GetAtt AuditHotTable.Arn
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                Resource: "*"
 
   DiscoverySfn:
     Type: AWS::Serverless::StateMachine
@@ -1202,6 +1062,13 @@ Resources:
               - Effect: Allow
                 Action: sns:Publish
                 Resource: !Ref CompletionsTopic
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                Resource: "*"
 
   RenewalSfn:
     Type: AWS::Serverless::StateMachine
@@ -1245,6 +1112,13 @@ Resources:
               - Effect: Allow
                 Action: sns:Publish
                 Resource: !Ref CompletionsTopic
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                Resource: "*"
 
   RotationSfn:
     Type: AWS::Serverless::StateMachine
@@ -1291,6 +1165,13 @@ Resources:
               - Effect: Allow
                 Action: sns:Publish
                 Resource: !Ref PasswordResetNotificationsTopic
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                Resource: "*"
 
   PasswordResetSfn:
     Type: AWS::Serverless::StateMachine
@@ -1360,412 +1241,6 @@ Resources:
       Principal: events.amazonaws.com
       SourceArn: !GetAtt ExpiryScheduleRule.Arn
 
-  # ---------------------------------------------------------------------------
-  # CloudWatch dashboard + alarms
-  # ---------------------------------------------------------------------------
-  JiraDlqDepthAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: app-d9fae51c-1929cc69-jira-dlq-depth
-      Namespace: AWS/SQS
-      MetricName: ApproximateNumberOfMessagesVisible
-      Dimensions:
-        - Name: QueueName
-          Value: !GetAtt JiraDlq.QueueName
-      Statistic: Maximum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      AlarmActions:
-        - !Ref OpsAlarmsTopic
-
-  DiscoverySfnFailedAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: app-d9fae51c-1929cc69-discovery-sfn-failed
-      Namespace: AWS/States
-      MetricName: ExecutionsFailed
-      Dimensions:
-        - Name: StateMachineArn
-          Value: !Ref DiscoverySfn
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      AlarmActions:
-        - !Ref OpsAlarmsTopic
-
-  RenewalSfnFailedAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: app-d9fae51c-1929cc69-renewal-sfn-failed
-      Namespace: AWS/States
-      MetricName: ExecutionsFailed
-      Dimensions:
-        - Name: StateMachineArn
-          Value: !Ref RenewalSfn
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      AlarmActions:
-        - !Ref OpsAlarmsTopic
-
-  RotationSfnFailedAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: app-d9fae51c-1929cc69-rotation-sfn-failed
-      Namespace: AWS/States
-      MetricName: ExecutionsFailed
-      Dimensions:
-        - Name: StateMachineArn
-          Value: !Ref RotationSfn
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      AlarmActions:
-        - !Ref OpsAlarmsTopic
-
-  PasswordResetSfnFailedAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: app-d9fae51c-1929cc69-password-reset-sfn-failed
-      Namespace: AWS/States
-      MetricName: ExecutionsFailed
-      Dimensions:
-        - Name: StateMachineArn
-          Value: !Ref PasswordResetSfn
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      AlarmActions:
-        - !Ref OpsAlarmsTopic
-
-  LambdaErrorAlarmDiscoveryAcm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: app-d9fae51c-1929cc69-discovery-acm-fn-errors
-      Namespace: AWS/Lambda
-      MetricName: Errors
-      Dimensions:
-        - Name: FunctionName
-          Value: !Ref DiscoveryAcmFunction
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      AlarmActions:
-        - !Ref OpsAlarmsTopic
-
-  LambdaErrorAlarmDiscoveryIam:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: app-d9fae51c-1929cc69-discovery-iam-fn-errors
-      Namespace: AWS/Lambda
-      MetricName: Errors
-      Dimensions:
-        - Name: FunctionName
-          Value: !Ref DiscoveryIamFunction
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      AlarmActions:
-        - !Ref OpsAlarmsTopic
-
-  LambdaErrorAlarmExpiryEvaluator:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: app-d9fae51c-1929cc69-expiry-evaluator-fn-errors
-      Namespace: AWS/Lambda
-      MetricName: Errors
-      Dimensions:
-        - Name: FunctionName
-          Value: !Ref ExpiryEvaluatorFunction
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      AlarmActions:
-        - !Ref OpsAlarmsTopic
-
-  LambdaErrorAlarmRenewalExecutor:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: app-d9fae51c-1929cc69-renewal-executor-fn-errors
-      Namespace: AWS/Lambda
-      MetricName: Errors
-      Dimensions:
-        - Name: FunctionName
-          Value: !Ref RenewalExecutorFunction
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      AlarmActions:
-        - !Ref OpsAlarmsTopic
-
-  LambdaErrorAlarmRotationIamKey:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: app-d9fae51c-1929cc69-rotation-iam-key-fn-errors
-      Namespace: AWS/Lambda
-      MetricName: Errors
-      Dimensions:
-        - Name: FunctionName
-          Value: !Ref RotationIamKeyFunction
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      AlarmActions:
-        - !Ref OpsAlarmsTopic
-
-  LambdaErrorAlarmJiraNotifier:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: app-d9fae51c-1929cc69-jira-notifier-fn-errors
-      Namespace: AWS/Lambda
-      MetricName: Errors
-      Dimensions:
-        - Name: FunctionName
-          Value: !Ref JiraNotifierFunction
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      AlarmActions:
-        - !Ref OpsAlarmsTopic
-
-  LambdaErrorAlarmApiCerts:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: app-d9fae51c-1929cc69-api-certs-fn-errors
-      Namespace: AWS/Lambda
-      MetricName: Errors
-      Dimensions:
-        - Name: FunctionName
-          Value: !Ref ApiCertsFunction
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      AlarmActions:
-        - !Ref OpsAlarmsTopic
-
-  LambdaErrorAlarmApiIam:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: app-d9fae51c-1929cc69-api-iam-fn-errors
-      Namespace: AWS/Lambda
-      MetricName: Errors
-      Dimensions:
-        - Name: FunctionName
-          Value: !Ref ApiIamFunction
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      AlarmActions:
-        - !Ref OpsAlarmsTopic
-
-  LambdaErrorAlarmApiAudit:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: app-d9fae51c-1929cc69-api-audit-fn-errors
-      Namespace: AWS/Lambda
-      MetricName: Errors
-      Dimensions:
-        - Name: FunctionName
-          Value: !Ref ApiAuditFunction
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      AlarmActions:
-        - !Ref OpsAlarmsTopic
-
-  LambdaErrorAlarmSyncOnPrem:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: app-d9fae51c-1929cc69-sync-on-prem-fn-errors
-      Namespace: AWS/Lambda
-      MetricName: Errors
-      Dimensions:
-        - Name: FunctionName
-          Value: !Ref SyncOnPremFunction
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      AlarmActions:
-        - !Ref OpsAlarmsTopic
-
-  LambdaErrorAlarmAuditExporter:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: app-d9fae51c-1929cc69-audit-exporter-fn-errors
-      Namespace: AWS/Lambda
-      MetricName: Errors
-      Dimensions:
-        - Name: FunctionName
-          Value: !Ref AuditExporterFunction
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      AlarmActions:
-        - !Ref OpsAlarmsTopic
-
-  LambdaErrorAlarmApiHealth:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: app-d9fae51c-1929cc69-api-health-fn-errors
-      Namespace: AWS/Lambda
-      MetricName: Errors
-      Dimensions:
-        - Name: FunctionName
-          Value: !Ref ApiHealthFunction
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      AlarmActions:
-        - !Ref OpsAlarmsTopic
-
-  LambdaErrorAlarmApiPasswordResets:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: app-d9fae51c-1929cc69-api-password-resets-fn-errors
-      Namespace: AWS/Lambda
-      MetricName: Errors
-      Dimensions:
-        - Name: FunctionName
-          Value: !Ref ApiPasswordResetsFunction
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      AlarmActions:
-        - !Ref OpsAlarmsTopic
-
-  LambdaErrorAlarmPasswordResetApprover:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: app-d9fae51c-1929cc69-password-reset-approver-fn-errors
-      Namespace: AWS/Lambda
-      MetricName: Errors
-      Dimensions:
-        - Name: FunctionName
-          Value: !Ref PasswordResetApproverFunction
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      AlarmActions:
-        - !Ref OpsAlarmsTopic
-
-  LambdaErrorAlarmPasswordResetExecutor:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: app-d9fae51c-1929cc69-password-reset-executor-fn-errors
-      Namespace: AWS/Lambda
-      MetricName: Errors
-      Dimensions:
-        - Name: FunctionName
-          Value: !Ref PasswordResetExecutorFunction
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      AlarmActions:
-        - !Ref OpsAlarmsTopic
-
-  Dashboard:
-    Type: AWS::CloudWatch::Dashboard
-    Properties:
-      DashboardName: app-d9fae51c-1929cc69-dashboard
-      DashboardBody: !Sub |
-        {
-          "widgets": [
-            {
-              "type": "metric",
-              "x": 0, "y": 0, "width": 12, "height": 6,
-              "properties": {
-                "title": "Lambda errors",
-                "view": "timeSeries",
-                "region": "${AWS::Region}",
-                "metrics": [
-                  ["AWS/Lambda", "Errors", "FunctionName", "${DiscoveryAcmFunction}"],
-                  ["AWS/Lambda", "Errors", "FunctionName", "${DiscoveryIamFunction}"],
-                  ["AWS/Lambda", "Errors", "FunctionName", "${ExpiryEvaluatorFunction}"],
-                  ["AWS/Lambda", "Errors", "FunctionName", "${RenewalExecutorFunction}"],
-                  ["AWS/Lambda", "Errors", "FunctionName", "${RotationIamKeyFunction}"],
-                  ["AWS/Lambda", "Errors", "FunctionName", "${JiraNotifierFunction}"],
-                  ["AWS/Lambda", "Errors", "FunctionName", "${ApiCertsFunction}"],
-                  ["AWS/Lambda", "Errors", "FunctionName", "${ApiIamFunction}"],
-                  ["AWS/Lambda", "Errors", "FunctionName", "${ApiAuditFunction}"],
-                  ["AWS/Lambda", "Errors", "FunctionName", "${ApiHealthFunction}"],
-                  ["AWS/Lambda", "Errors", "FunctionName", "${SyncOnPremFunction}"],
-                  ["AWS/Lambda", "Errors", "FunctionName", "${AuditExporterFunction}"],
-                  ["AWS/Lambda", "Errors", "FunctionName", "${ApiPasswordResetsFunction}"],
-                  ["AWS/Lambda", "Errors", "FunctionName", "${PasswordResetApproverFunction}"],
-                  ["AWS/Lambda", "Errors", "FunctionName", "${PasswordResetExecutorFunction}"]
-                ]
-              }
-            },
-            {
-              "type": "metric",
-              "x": 12, "y": 0, "width": 12, "height": 6,
-              "properties": {
-                "title": "Step Functions failed executions",
-                "view": "timeSeries",
-                "region": "${AWS::Region}",
-                "metrics": [
-                  ["AWS/States", "ExecutionsFailed", "StateMachineArn", "${DiscoverySfn}"],
-                  ["AWS/States", "ExecutionsFailed", "StateMachineArn", "${RenewalSfn}"],
-                  ["AWS/States", "ExecutionsFailed", "StateMachineArn", "${RotationSfn}"],
-                  ["AWS/States", "ExecutionsFailed", "StateMachineArn", "${PasswordResetSfn}"]
-                ]
-              }
-            },
-            {
-              "type": "metric",
-              "x": 0, "y": 6, "width": 12, "height": 6,
-              "properties": {
-                "title": "Jira DLQ depth",
-                "view": "timeSeries",
-                "region": "${AWS::Region}",
-                "metrics": [
-                  ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${JiraDlq.QueueName}"]
-                ]
-              }
-            }
-          ]
-        }
-
 Outputs:
   AppUrl:
     Description: Self-service UI (CloudFront)
@@ -1789,9 +1264,3 @@ Outputs:
     Value: !Ref AuditHotTable
   PasswordResetRequestsTableName:
     Value: !Ref PasswordResetRequestsTable
-  TestInstance1Id:
-    Value: !Ref TestInstance1
-  TestInstance2Id:
-    Value: !Ref TestInstance2
-  TestInstance3Id:
-    Value: !Ref TestInstance3
