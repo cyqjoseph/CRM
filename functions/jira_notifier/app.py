@@ -10,6 +10,8 @@ import os
 
 import boto3
 
+from crm_common import structured_log
+
 JIRA_TOKEN_SECRET_ARN = os.environ["JIRA_TOKEN_SECRET_ARN"]
 JIRA_BASE_URL = os.environ.get("JIRA_BASE_URL", "https://example.atlassian.net")
 
@@ -24,7 +26,7 @@ def _jira_token():
     return _secrets_cache["token"]
 
 
-def _create_ticket(http_client, resource_id, resource_type, severity, expiry):
+def _create_ticket(http_client, request_id, resource_id, resource_type, severity, expiry):
     token = _jira_token()
     body = json.dumps(
         {
@@ -43,25 +45,34 @@ def _create_ticket(http_client, resource_id, resource_type, severity, expiry):
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
     )
     if response.status >= 300:
+        structured_log(
+            request_id, "JIRA_TICKET_CREATE_FAILED", level="ERROR", resourceId=resource_id, status=response.status
+        )
         raise RuntimeError(f"Jira ticket creation failed with status {response.status}")
+    structured_log(request_id, "JIRA_TICKET_CREATE_OK", resourceId=resource_id)
     return json.loads(response.data)
 
 
 def handler(event, context):
     import urllib3
 
+    request_id = getattr(context, "aws_request_id", "local")
     http_client = urllib3.PoolManager()
+    records = event.get("Records", [])
+    structured_log(request_id, "JIRA_NOTIFIER_START", recordCount=len(records))
 
-    for record in event.get("Records", []):
+    for record in records:
         payload = json.loads(record["body"])
         # Any exception here leaves this record unacknowledged; SQS redrives
         # it and, after maxReceiveCount, moves it to the DLQ untouched.
         _create_ticket(
             http_client,
+            request_id,
             payload["resourceId"],
             payload["resourceType"],
             payload["severity"],
             payload.get("expiry"),
         )
 
-    return {"processed": len(event.get("Records", []))}
+    structured_log(request_id, "JIRA_NOTIFIER_COMPLETE", processed=len(records))
+    return {"processed": len(records)}

@@ -96,3 +96,24 @@ def test_written_items_never_store_the_raw_access_key_id(mock_client, mock_resou
 
 def json_dumps_safe(item):
     return "".join(f"{k}={v}" for k, v in item.items())
+
+
+@patch("boto3.resource")
+@patch("boto3.client")
+def test_write_is_conditional_and_stale_writes_are_skipped_not_failed(mock_client, mock_resource):
+    import botocore.exceptions
+
+    mock_client.return_value = _iam_client([("svc-payments", [("AKIA1", 4, "Active")])])
+
+    table = MagicMock()
+    table.put_item.side_effect = botocore.exceptions.ClientError(
+        {"Error": {"Code": "ConditionalCheckFailedException", "Message": "stale"}},
+        "PutItem",
+    )
+    mock_resource.return_value.Table.return_value = table
+
+    result = app.handler({}, None)
+
+    assert result == {"discovered": 1, "written": 0, "skipped": 1, "failed": 0}
+    kwargs = table.put_item.call_args.kwargs
+    assert kwargs["ConditionExpression"] == "attribute_not_exists(#v) OR #v < :new_version"

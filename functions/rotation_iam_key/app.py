@@ -9,9 +9,13 @@ See README.md's Deviations section.
 """
 from datetime import datetime, timezone
 
+from crm_common import structured_log
+
 
 def handler(event, context):
+    request_id = getattr(context, "aws_request_id", "local")
     account_id_hash = event["accountIdHash"]
+    structured_log(request_id, "ROTATION_IAM_KEY_FLAGGED", accountIdHash=account_id_hash, mode="NOTIFY_ONLY")
     return {
         "accountIdHash": account_id_hash,
         "flaggedAt": datetime.now(timezone.utc).isoformat(),

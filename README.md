@@ -219,6 +219,48 @@ authoritative. Concretely:
   condition has no per-caller identity to key off; the application-level
   check achieves the same isolation.
 
+## Hardening pass: idempotency, logging, and least-privilege gaps
+
+A later audit re-checked this system against its own requirements (discovery
+writes are idempotent, every Lambda emits structured logs, IAM policies carry
+no avoidable wildcards, the SNS/SQS expiry fan-out is truly independent, and
+no unauthenticated write path can smuggle an unexpected field into DynamoDB).
+It found the infrastructure itself already complete — every state machine,
+discovery/renewal/rotation Lambda, IAM role, and EventBridge rule described
+below already existed — and fixed six concrete gaps rather than rebuilding
+anything:
+
+- `discovery-acm-fn`/`discovery-iam-fn` now write with a conditional
+  `ConditionExpression` on their `Version` attribute, so a retried or
+  duplicate invocation is a safe no-op (counted as `skipped`) instead of
+  clobbering a newer row with stale data.
+- `expiry-evaluator-fn`'s SNS publish and SQS ticket-send were coupled
+  through a `try/finally` that let an SNS exception propagate and abort the
+  rest of that invocation's matches. They are now independent `try/except`
+  calls that each return a boolean; the audit event records `ALERTED` only
+  when both succeeded, `PARTIAL` otherwise, and no failure blocks the
+  remaining matches.
+- `discovery-acm-fn`'s IAM policy dropped the unused
+  `secretsmanager:DescribeSecret` grant (the function only ever calls
+  `list_secrets`) and moved `acm:DescribeCertificate` out of the wildcard
+  `Resource: "*"` statement into its own ARN-scoped grant, matching the
+  pattern `renewal-executor-fn` already used.
+- `sync-on-prem-fn` (`POST /sync/on-prem-data`) previously wrote the caller's
+  request body straight into DynamoDB with no field filtering and no audit
+  trail — the one write path that didn't share the allow-list discipline the
+  rest of the system uses. It now filters through a per-table
+  `ALLOWED_FIELDS` set before the write and records a `SYNC_ON_PREM_DATA`
+  audit event, same as every other mutation in the system.
+- `renewal-executor-fn`, `rotation-iam-key-fn`, and `jira-notifier-fn` had no
+  logging at all; they now emit the same `crm_common.structured_log` JSON
+  events as the discovery and expiry functions.
+- `tests/test_template.py` gained a check that `DiscoverySfnRole`,
+  `RenewalSfnRole`, `RotationSfnRole`, `PasswordResetSfnRole`, and
+  `EventBridgeSfnRole` all carry the mandated `PermissionsBoundary`, and its
+  `MANDATORY_WILDCARD_ACTIONS` allow-list was narrowed to match the policy
+  fix above — so a future regression on either front fails this suite
+  instead of passing silently.
+
 ## Validating a deployment
 
 Both scripts resolve the stack's outputs themselves (`scripts/lib-stack-outputs.sh`),

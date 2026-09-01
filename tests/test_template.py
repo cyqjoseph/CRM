@@ -60,9 +60,7 @@ REQUIRED_ROUTES = {
 # a correctly-scoped ARN would deny the very first invocation.
 MANDATORY_WILDCARD_ACTIONS = {
     "acm:ListCertificates",
-    "acm:DescribeCertificate",
     "secretsmanager:ListSecrets",
-    "secretsmanager:DescribeSecret",
     "iam:ListServerCertificates",
     "iam:ListUsers",
     "iam:ListAccessKeys",
@@ -229,6 +227,21 @@ def test_no_unquoted_yaml_boolean_aliases_in_the_template():
         "true/false — quote them if the service expects a string:\n"
         + "\n".join(offenders)
     )
+
+
+def test_step_function_and_eventbridge_roles_have_the_deploy_boundary():
+    boundary_arn = "arn:aws:iam::544635841962:policy/brd-architect-deploy-boundary"
+    for logical_id in (
+        "DiscoverySfnRole",
+        "RenewalSfnRole",
+        "RotationSfnRole",
+        "PasswordResetSfnRole",
+        "EventBridgeSfnRole",
+    ):
+        props = RESOURCES[logical_id]["Properties"]
+        assert props["PermissionsBoundary"] == boundary_arn, (
+            f"{logical_id}.PermissionsBoundary must be {boundary_arn!r}"
+        )
 
 
 def test_ssm_parameters_live_under_the_mandated_path():

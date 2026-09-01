@@ -9,8 +9,9 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import boto3
+import botocore.exceptions
 
-from crm_common import hash_identifier
+from crm_common import hash_identifier, structured_log
 
 IAM_TABLE_NAME = os.environ["IAM_TABLE_NAME"]
 
@@ -63,20 +64,66 @@ def _next_rotation_date(created, now):
     return target.isoformat()
 
 
+def _is_conditional_check_failure(exc):
+    return (
+        isinstance(exc, botocore.exceptions.ClientError)
+        and exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException"
+    )
+
+
 def handler(event, context):
+    request_id = getattr(context, "aws_request_id", "local")
+    structured_log(request_id, "DISCOVERY_IAM_START")
+
     iam = boto3.client("iam")
     table = boto3.resource("dynamodb").Table(IAM_TABLE_NAME)
     now = datetime.now(timezone.utc)
 
     discovered = _discover_iam_accounts(iam, now)
+    structured_log(request_id, "DISCOVERY_IAM_SCAN_COMPLETE", count=len(discovered))
 
     written = 0
+    skipped = 0
+    failed = 0
     for item in discovered:
         item["Source"] = "AWS_IAM"
         item["EnvironmentTag"] = "aws"
         item["LastSyncedAt"] = now.isoformat()
-        item["Version"] = int(time.time())
-        table.put_item(Item=item)
+        version = int(time.time())
+        item["Version"] = version
+        try:
+            # Conditional write: only overwrite if this row is new or newer —
+            # guards against a retried/duplicate invocation clobbering a newer
+            # write with stale data (idempotency per the version attribute).
+            table.put_item(
+                Item=item,
+                ConditionExpression="attribute_not_exists(#v) OR #v < :new_version",
+                ExpressionAttributeNames={"#v": "Version"},
+                ExpressionAttributeValues={":new_version": version},
+            )
+        except Exception as exc:
+            if _is_conditional_check_failure(exc):
+                skipped += 1
+                structured_log(request_id, "DISCOVERY_WRITE_SKIPPED_STALE", accountIdHash=item.get("AccountIdHash"))
+                continue
+            failed += 1
+            structured_log(
+                request_id,
+                "DISCOVERY_WRITE_FAILED",
+                level="ERROR",
+                accountIdHash=item.get("AccountIdHash"),
+                error=str(exc),
+            )
+            continue
         written += 1
+        structured_log(request_id, "DISCOVERY_WRITE_OK", accountIdHash=item.get("AccountIdHash"))
 
-    return {"discovered": len(discovered), "written": written}
+    structured_log(
+        request_id,
+        "DISCOVERY_IAM_COMPLETE",
+        discovered=len(discovered),
+        written=written,
+        skipped=skipped,
+        failed=failed,
+    )
+    return {"discovered": len(discovered), "written": written, "skipped": skipped, "failed": failed}

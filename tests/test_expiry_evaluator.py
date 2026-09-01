@@ -2,8 +2,6 @@ import os
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from conftest import load_module
 
 app = load_module("expiry_evaluator_app", "functions/expiry_evaluator/app.py")
@@ -56,9 +54,14 @@ def test_sns_publish_and_sqs_send_both_called(mock_client, mock_resource):
 @patch("boto3.resource")
 @patch("boto3.client")
 def test_sqs_send_still_happens_when_sns_publish_fails(mock_client, mock_resource):
-    """The two fan-outs are independent: an SNS failure must not skip the SQS send."""
-    cert_items = [{"CertId": "cert-1", "ExpiryDate": _soon(5)}]
-    mock_resource.return_value = _mock_dynamo(cert_items, [])
+    """The two fan-outs are independent: an SNS failure must not skip the SQS
+    send, must not raise, and must not abort processing of other matches."""
+    cert_items = [
+        {"CertId": "cert-1", "ExpiryDate": _soon(5)},
+        {"CertId": "cert-2", "ExpiryDate": _soon(5)},
+    ]
+    dynamodb = _mock_dynamo(cert_items, [])
+    mock_resource.return_value = dynamodb
 
     sns = MagicMock()
     sns.publish.side_effect = RuntimeError("sns unavailable")
@@ -69,8 +72,35 @@ def test_sqs_send_still_happens_when_sns_publish_fails(mock_client, mock_resourc
 
     mock_client.side_effect = client_side_effect
 
-    with pytest.raises(RuntimeError):
-        app.handler({}, None)
+    result = app.handler({}, None)
+
+    assert sns.publish.called
+    assert sqs.send_message.call_count == 2
+    assert result["alerted"] == 2
+
+    audit_table = dynamodb.Table(os.environ["AUDIT_TABLE_NAME"])
+    outcomes = {call.kwargs["Item"]["Outcome"] for call in audit_table.put_item.call_args_list}
+    assert outcomes == {"PARTIAL"}
+
+
+@patch("boto3.resource")
+@patch("boto3.client")
+def test_sns_send_still_happens_when_sqs_send_fails(mock_client, mock_resource):
+    """Symmetric case: an SQS failure must not skip the SNS publish."""
+    cert_items = [{"CertId": "cert-1", "ExpiryDate": _soon(5)}]
+    mock_resource.return_value = _mock_dynamo(cert_items, [])
+
+    sns = MagicMock()
+    sqs = MagicMock()
+    sqs.send_message.side_effect = RuntimeError("sqs unavailable")
+
+    def client_side_effect(service_name, *a, **kw):
+        return {"sns": sns, "sqs": sqs}[service_name]
+
+    mock_client.side_effect = client_side_effect
+
+    result = app.handler({}, None)
 
     assert sns.publish.called
     assert sqs.send_message.called
+    assert result["alerted"] == 1

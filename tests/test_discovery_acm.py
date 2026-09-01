@@ -142,7 +142,7 @@ def test_describe_certificate_failure_does_not_block_other_certs(mock_client, mo
 
     result = app.handler({}, None)
 
-    assert result == {"discovered": 1, "written": 1, "failed": 0}
+    assert result == {"discovered": 1, "written": 1, "skipped": 0, "failed": 0}
     item = table.put_item.call_args_list[0].kwargs["Item"]
     assert item["CertId"] == "arn:aws:acm:cert/good"
 
@@ -186,7 +186,7 @@ def test_put_item_failure_is_logged_and_does_not_block_other_writes(mock_client,
 
     result = app.handler({}, None)
 
-    assert result == {"discovered": 2, "written": 1, "failed": 1}
+    assert result == {"discovered": 2, "written": 1, "skipped": 0, "failed": 1}
     assert table.put_item.call_count == 2
 
 
@@ -221,4 +221,50 @@ def test_one_failed_source_does_not_block_other_sources(mock_client, mock_resour
 
     result = app.handler({}, None)
 
-    assert result == {"discovered": 1, "written": 1, "failed": 0}
+    assert result == {"discovered": 1, "written": 1, "skipped": 0, "failed": 0}
+
+
+@patch("boto3.resource")
+@patch("boto3.client")
+def test_write_is_conditional_on_a_newer_version_and_stale_writes_are_skipped_not_failed(
+    mock_client, mock_resource
+):
+    """A duplicate/retried invocation racing an already-written newer row must
+    be treated as an idempotent no-op, not counted as a failure."""
+    import botocore.exceptions
+
+    acm, iam, secretsmanager = MagicMock(), MagicMock(), MagicMock()
+
+    def client_side_effect(name, *args, **kwargs):
+        return {"acm": acm, "iam": iam, "secretsmanager": secretsmanager}[name]
+
+    mock_client.side_effect = client_side_effect
+
+    acm.get_paginator.return_value = _paginator(
+        [{"CertificateSummaryList": [{"CertificateArn": "arn:aws:acm:cert/1"}]}]
+    )
+    acm.describe_certificate.return_value = {
+        "Certificate": {
+            "CertificateArn": "arn:aws:acm:cert/1",
+            "DomainName": "example.com",
+            "NotAfter": datetime(2027, 1, 1, tzinfo=timezone.utc),
+            "Status": "ISSUED",
+        }
+    }
+    iam.get_paginator.return_value = _paginator([{"ServerCertificateMetadataList": []}])
+    secretsmanager.get_paginator.return_value = _paginator([{"SecretList": []}])
+
+    table = MagicMock()
+    table.put_item.side_effect = botocore.exceptions.ClientError(
+        {"Error": {"Code": "ConditionalCheckFailedException", "Message": "stale"}},
+        "PutItem",
+    )
+    mock_resource.return_value.Table.return_value = table
+
+    result = app.handler({}, None)
+
+    assert result == {"discovered": 1, "written": 0, "skipped": 1, "failed": 0}
+    kwargs = table.put_item.call_args.kwargs
+    assert kwargs["ConditionExpression"] == "attribute_not_exists(#v) OR #v < :new_version"
+    assert kwargs["ExpressionAttributeNames"] == {"#v": "Version"}
+    assert ":new_version" in kwargs["ExpressionAttributeValues"]

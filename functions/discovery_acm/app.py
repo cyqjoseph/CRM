@@ -3,15 +3,14 @@
 Writes ONLY lifecycle metadata to the cert inventory table. Must never persist
 plaintext certificate or private key material (Requirement 1.4).
 """
-import logging
 import os
 import time
 from datetime import datetime, timezone
 
 import boto3
+import botocore.exceptions
 
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+from crm_common import structured_log
 
 CERT_TABLE_NAME = os.environ["CERT_TABLE_NAME"]
 
@@ -43,21 +42,22 @@ def _discover_acm_certs(acm_client, request_id):
     paginator = acm_client.get_paginator("list_certificates")
     for page in paginator.paginate():
         summaries = page.get("CertificateSummaryList", [])
-        logger.info("[%s] acm:ListCertificates page returned %d certificate(s)", request_id, len(summaries))
+        structured_log(request_id, "ACM_LIST_PAGE", source="acm", count=len(summaries))
         for summary in summaries:
             arn = summary["CertificateArn"]
             try:
                 detail = acm_client.describe_certificate(CertificateArn=arn)
-            except Exception:
-                logger.exception("[%s] acm:DescribeCertificate failed for %s", request_id, arn)
+            except Exception as exc:
+                structured_log(request_id, "ACM_DESCRIBE_FAILED", level="ERROR", source="acm", certArn=arn, error=str(exc))
                 continue
             cert = detail["Certificate"]
-            logger.info(
-                "[%s] acm:DescribeCertificate ok for %s domain=%s status=%s",
+            structured_log(
                 request_id,
-                arn,
-                cert.get("DomainName"),
-                cert.get("Status"),
+                "ACM_DESCRIBE_OK",
+                source="acm",
+                certArn=arn,
+                domain=cert.get("DomainName"),
+                status=cert.get("Status"),
             )
             items.append(
                 {
@@ -79,7 +79,7 @@ def _discover_iam_server_certs(iam_client, request_id):
     paginator = iam_client.get_paginator("list_server_certificates")
     for page in paginator.paginate():
         metas = page.get("ServerCertificateMetadataList", [])
-        logger.info("[%s] iam:ListServerCertificates page returned %d certificate(s)", request_id, len(metas))
+        structured_log(request_id, "IAM_LIST_PAGE", source="iam", count=len(metas))
         for meta in metas:
             items.append(
                 {
@@ -103,7 +103,7 @@ def _discover_secrets_manager_certs(secretsmanager_client, request_id):
         Filters=[{"Key": "tag-key", "Values": ["crm:resource-type"]}]
     ):
         secrets = page.get("SecretList", [])
-        logger.info("[%s] secretsmanager:ListSecrets page returned %d secret(s)", request_id, len(secrets))
+        structured_log(request_id, "SECRETSMANAGER_LIST_PAGE", source="secretsmanager", count=len(secrets))
         for secret in secrets:
             tags = {t["Key"]: t["Value"] for t in secret.get("Tags", [])}
             if tags.get("crm:resource-type") != "certificate":
@@ -130,9 +130,16 @@ _DISCOVERERS = (
 )
 
 
+def _is_conditional_check_failure(exc):
+    return (
+        isinstance(exc, botocore.exceptions.ClientError)
+        and exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException"
+    )
+
+
 def handler(event, context):
     request_id = getattr(context, "aws_request_id", "local")
-    logger.info("[%s] discovery-acm-fn starting", request_id)
+    structured_log(request_id, "DISCOVERY_ACM_START")
 
     clients = {
         "acm": boto3.client("acm"),
@@ -145,36 +152,52 @@ def handler(event, context):
     for discover_fn, client_key, source_name in _DISCOVERERS:
         try:
             found = discover_fn(clients[client_key], request_id)
-        except Exception:
+        except Exception as exc:
             # One resource type's API call (e.g. AccessDenied on
             # iam:ListServerCertificates) must never prevent the others from
             # being discovered and written — a partial scan beats a silent
             # empty one.
-            logger.exception("[%s] %s discovery failed", request_id, source_name)
+            structured_log(request_id, "DISCOVERY_SOURCE_FAILED", level="ERROR", source=source_name, error=str(exc))
             continue
-        logger.info("[%s] %s discovery found %d item(s)", request_id, source_name, len(found))
+        structured_log(request_id, "DISCOVERY_SOURCE_OK", source=source_name, count=len(found))
         discovered.extend(found)
 
     written = 0
+    skipped = 0
     failed = 0
     for raw_item in discovered:
         item = _sanitize(raw_item)
-        item["Version"] = int(time.time())
+        version = int(time.time())
+        item["Version"] = version
         item["LastSyncedAt"] = datetime.now(timezone.utc).isoformat()
         try:
-            table.put_item(Item=item)
-        except Exception:
+            # Conditional write: only overwrite if this row is new or this
+            # Version is newer than what's already stored — guards against a
+            # retried/duplicate invocation clobbering a newer write with stale
+            # data (idempotency per Requirement's "version attribute").
+            table.put_item(
+                Item=item,
+                ConditionExpression="attribute_not_exists(#v) OR #v < :new_version",
+                ExpressionAttributeNames={"#v": "Version"},
+                ExpressionAttributeValues={":new_version": version},
+            )
+        except Exception as exc:
+            if _is_conditional_check_failure(exc):
+                skipped += 1
+                structured_log(request_id, "DISCOVERY_WRITE_SKIPPED_STALE", certId=item.get("CertId"))
+                continue
             failed += 1
-            logger.exception("[%s] dynamodb:PutItem failed for CertId=%s", request_id, item.get("CertId"))
+            structured_log(request_id, "DISCOVERY_WRITE_FAILED", level="ERROR", certId=item.get("CertId"), error=str(exc))
             continue
         written += 1
-        logger.info("[%s] dynamodb:PutItem ok for CertId=%s", request_id, item.get("CertId"))
+        structured_log(request_id, "DISCOVERY_WRITE_OK", certId=item.get("CertId"))
 
-    logger.info(
-        "[%s] discovery-acm-fn complete discovered=%d written=%d failed=%d",
+    structured_log(
         request_id,
-        len(discovered),
-        written,
-        failed,
+        "DISCOVERY_ACM_COMPLETE",
+        discovered=len(discovered),
+        written=written,
+        skipped=skipped,
+        failed=failed,
     )
-    return {"discovered": len(discovered), "written": written, "failed": failed}
+    return {"discovered": len(discovered), "written": written, "skipped": skipped, "failed": failed}

@@ -6,11 +6,10 @@ a failure sending to SQS must never prevent the SNS publish, and vice versa.
 """
 import json
 import os
-import time
 from datetime import datetime, timedelta, timezone
 
 import boto3
-from crm_common import put_audit_event
+from crm_common import put_audit_event, structured_log
 
 CERT_TABLE_NAME = os.environ["CERT_TABLE_NAME"]
 IAM_TABLE_NAME = os.environ["IAM_TABLE_NAME"]
@@ -37,37 +36,59 @@ def _severity_for(days_out):
     return match
 
 
-def _publish_alert(sns, resource_id, resource_type, severity, expiry_value):
+def _publish_alert(sns, request_id, resource_id, resource_type, severity, expiry_value):
+    """Returns True on success. Never raises — a publish failure must not
+    prevent the independent SQS ticket-creation send below (Requirement 4.3)."""
     topic_arn = _SEVERITY_TOPIC[severity]
-    sns.publish(
-        TopicArn=topic_arn,
-        Subject=f"{resource_type} {resource_id} expiring soon ({severity})",
-        Message=json.dumps(
-            {
-                "resourceId": resource_id,
-                "resourceType": resource_type,
-                "severity": severity,
-                "expiry": expiry_value,
-            }
-        ),
-    )
+    try:
+        sns.publish(
+            TopicArn=topic_arn,
+            Subject=f"{resource_type} {resource_id} expiring soon ({severity})",
+            Message=json.dumps(
+                {
+                    "resourceId": resource_id,
+                    "resourceType": resource_type,
+                    "severity": severity,
+                    "expiry": expiry_value,
+                }
+            ),
+        )
+    except Exception as exc:
+        structured_log(
+            request_id, "ALERT_SNS_PUBLISH_FAILED", level="ERROR", resourceId=resource_id, severity=severity, error=str(exc)
+        )
+        return False
+    structured_log(request_id, "ALERT_SNS_PUBLISHED", resourceId=resource_id, severity=severity)
+    return True
 
 
-def _send_ticket_request(sqs, resource_id, resource_type, severity, expiry_value):
-    sqs.send_message(
-        QueueUrl=JIRA_QUEUE_URL,
-        MessageBody=json.dumps(
-            {
-                "resourceId": resource_id,
-                "resourceType": resource_type,
-                "severity": severity,
-                "expiry": expiry_value,
-            }
-        ),
-    )
+def _send_ticket_request(sqs, request_id, resource_id, resource_type, severity, expiry_value):
+    """Returns True on success. Never raises — independent of the SNS publish above."""
+    try:
+        sqs.send_message(
+            QueueUrl=JIRA_QUEUE_URL,
+            MessageBody=json.dumps(
+                {
+                    "resourceId": resource_id,
+                    "resourceType": resource_type,
+                    "severity": severity,
+                    "expiry": expiry_value,
+                }
+            ),
+        )
+    except Exception as exc:
+        structured_log(
+            request_id, "ALERT_TICKET_QUEUE_FAILED", level="ERROR", resourceId=resource_id, severity=severity, error=str(exc)
+        )
+        return False
+    structured_log(request_id, "ALERT_TICKET_QUEUED", resourceId=resource_id, severity=severity)
+    return True
 
 
 def handler(event, context):
+    request_id = getattr(context, "aws_request_id", "local")
+    structured_log(request_id, "EXPIRY_EVALUATOR_START")
+
     dynamodb = boto3.resource("dynamodb")
     sns = boto3.client("sns")
     sqs = boto3.client("sqs")
@@ -107,19 +128,26 @@ def handler(event, context):
         if severity is None:
             continue
 
-        # Independent fan-out: SNS publish failure must not skip the SQS send, and vice versa.
-        try:
-            _publish_alert(sns, resource_id, resource_type, severity, expiry_value)
-        finally:
-            _send_ticket_request(sqs, resource_id, resource_type, severity, expiry_value)
+        # Independent fan-out: neither call raises, so an SNS publish failure
+        # never skips the SQS send (or vice versa), and one bad match never
+        # aborts the rest of this batch.
+        sns_ok = _publish_alert(sns, request_id, resource_id, resource_type, severity, expiry_value)
+        sqs_ok = _send_ticket_request(sqs, request_id, resource_id, resource_type, severity, expiry_value)
 
         put_audit_event(
             entity_id=resource_id,
             event_type="EXPIRY_ALERT",
             actor="expiry-evaluator-fn",
-            outcome="ALERTED",
-            detail={"severity": severity, "expiry": expiry_value, "resourceType": resource_type},
+            outcome="ALERTED" if sns_ok and sqs_ok else "PARTIAL",
+            detail={
+                "severity": severity,
+                "expiry": expiry_value,
+                "resourceType": resource_type,
+                "snsPublished": sns_ok,
+                "ticketQueued": sqs_ok,
+            },
         )
         alerted += 1
 
+    structured_log(request_id, "EXPIRY_EVALUATOR_COMPLETE", evaluated=len(matches), alerted=alerted)
     return {"evaluated": len(matches), "alerted": alerted}

@@ -127,3 +127,10 @@ def owner_id_of(claims):
 
 def new_request_id():
     return str(uuid.uuid4())
+
+
+def structured_log(request_id, event_type, level="INFO", **fields):
+    """Emit one JSON line to stdout — CloudWatch Logs captures it as a single,
+    greppable/filterable structured event rather than an opaque format string.
+    """
+    print(json.dumps({"requestId": request_id, "level": level, "eventType": event_type, **fields}, default=str))
