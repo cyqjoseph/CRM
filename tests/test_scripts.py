@@ -99,12 +99,24 @@ def test_deploy_invokes_both_discovery_lambdas_after_the_stack_is_up():
     code = _without_comments(DEPLOY)
     assert "app-d9fae51c-1929cc69-discovery-iam-fn" in code
     assert "app-d9fae51c-1929cc69-discovery-acm-fn" in code
-    assert code.count("aws lambda invoke") == 2
+    assert code.count("aws lambda invoke") == 3
     # CLI v2 requires this for a blob (Payload) parameter passed as raw JSON.
     assert "--cli-binary-format raw-in-base64-out" in code
     # A discovery Lambda failing must never fail the whole deploy.
     assert code.index("sam deploy") < code.index("discovery-iam-fn"), (
         "the discovery Lambdas must be invoked after the stack exists"
+    )
+
+
+def test_deploy_invokes_the_ec2_discovery_lambda_after_the_stack_is_up():
+    # Same reasoning as the IAM/ACM discovery Lambdas: confirm the SSM dispatch
+    # works right after deploy instead of waiting for the first scheduled tick.
+    code = _without_comments(DEPLOY)
+    assert "app-d9fae51c-1929cc69-ec2-discovery-fn" in code
+    call = code[code.index("app-d9fae51c-1929cc69-ec2-discovery-fn"):][:400]
+    assert "||" in call, "an ec2-discovery-fn invocation failure must warn and continue, not exit non-zero"
+    assert code.index("sam deploy") < code.index("app-d9fae51c-1929cc69-ec2-discovery-fn"), (
+        "the ec2-discovery Lambda must be invoked after the stack exists"
     )
 
 

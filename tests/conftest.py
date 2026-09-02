@@ -30,6 +30,7 @@ os.environ.setdefault(
 os.environ.setdefault(
     "PASSWORD_RESET_NOTIFICATIONS_TOPIC_ARN", "arn:aws:sns:ap-southeast-1:123456789012:test-password-reset-notifications"
 )
+os.environ.setdefault("CERT_SCANNER_INSTANCE_ID_PARAM", "/app-d9fae51c-1929cc69/ec2/cert-scanner-instance-id")
 
 
 def load_module(name, relative_path):

@@ -237,6 +237,68 @@ def test_no_unquoted_yaml_boolean_aliases_in_the_template():
     )
 
 
+# CLAUDE.md's given public subnet ids for the account's existing default VPC —
+# the only subnets a new resource may be placed in.
+ALLOWED_PUBLIC_SUBNET_IDS = {
+    "subnet-0f43b5569d97d4bda",
+    "subnet-0f0834e47e6db3a6d",
+    "subnet-07a510b42806744f0",
+}
+
+
+def test_cert_scanner_security_group_has_no_inbound_rules():
+    """SSH access to the cert-scanner instance goes through SSM Session Manager
+    (AmazonSSMManagedInstanceCore on Ec2CertScannerRole), not an open port 22 —
+    so this security group must carry no SecurityGroupIngress at all."""
+    sg = RESOURCES["Ec2CertScannerSecurityGroup"]["Properties"]
+    assert "SecurityGroupIngress" not in sg
+    assert sg["VpcId"] == "vpc-01d3b02b0f1c07aa0"
+
+
+def test_cert_scanner_instance_is_t3_micro_in_an_allowed_public_subnet():
+    instance = RESOURCES["Ec2CertScannerInstance"]["Properties"]
+    assert instance["InstanceType"] == "t3.micro"
+    assert instance["SubnetId"] in ALLOWED_PUBLIC_SUBNET_IDS
+
+
+def test_cert_scanner_root_volume_is_20gb_gp3_encrypted():
+    instance = RESOURCES["Ec2CertScannerInstance"]["Properties"]
+    ebs = instance["BlockDeviceMappings"][0]["Ebs"]
+    assert ebs["VolumeSize"] == 20
+    assert ebs["VolumeType"] == "gp3"
+    assert ebs["Encrypted"] is True
+
+
+def test_cert_scanner_role_has_ssm_managed_instance_core_and_boundary():
+    role = RESOURCES["Ec2CertScannerRole"]["Properties"]
+    assert "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore" in role["ManagedPolicyArns"]
+    assert role["PermissionsBoundary"] == (
+        "arn:aws:iam::544635841962:policy/brd-architect-deploy-boundary"
+    )
+
+
+def test_cert_scanner_ssm_parameters_live_under_the_mandated_path():
+    for logical_id in ("Ec2CertScannerInstanceIdParam", "Ec2CertScannerPrivateIpParam"):
+        name = RESOURCES[logical_id]["Properties"]["Name"]
+        assert name.startswith("/app-d9fae51c-1929cc69/")
+
+
+def test_ec2_discovery_schedule_rule_targets_the_ec2_discovery_function():
+    rule = RESOURCES["Ec2DiscoveryScheduleRule"]["Properties"]
+    assert rule["ScheduleExpression"] == "rate(30 minutes)"
+    assert rule["State"] == "ENABLED"
+    targets = rule["Targets"]
+    assert len(targets) == 1
+    assert targets[0]["Arn"] == {"Fn::GetAtt": "Ec2DiscoveryFunction.Arn"}
+
+
+def test_ec2_discovery_invoke_permission_scoped_to_its_own_rule():
+    perm = RESOURCES["Ec2DiscoveryInvokePermission"]["Properties"]
+    assert perm["Principal"] == "events.amazonaws.com"
+    assert perm["SourceArn"] == {"Fn::GetAtt": "Ec2DiscoveryScheduleRule.Arn"}
+    assert perm["FunctionName"] == {"Fn::Ref": "Ec2DiscoveryFunction"}
+
+
 def test_step_function_and_eventbridge_roles_have_the_deploy_boundary():
     boundary_arn = "arn:aws:iam::544635841962:policy/brd-architect-deploy-boundary"
     for logical_id in (

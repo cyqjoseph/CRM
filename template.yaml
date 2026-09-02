@@ -11,6 +11,12 @@ Parameters:
     Type: String
     Default: https://example.atlassian.net
     Description: Base URL of the Jira Cloud instance tickets are created in.
+  UbuntuAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id
+    Description: >
+      Latest Ubuntu 22.04 LTS AMI, resolved at deploy time from Canonical's
+      own public SSM parameter — never a hand-pinned AMI id that goes stale.
 Globals:
   Function:
     Runtime: python3.13
@@ -536,6 +542,36 @@ Resources:
                 - iam:ListUsers
                 - iam:ListAccessKeys
               Resource: "*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                - logs:DescribeLogGroups
+                - logs:DescribeLogStreams
+              Resource: "*"
+
+  Ec2DiscoveryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: app-d9fae51c-1929cc69-ec2-discovery-fn
+      CodeUri: functions/ec2_discovery/
+      Handler: app.handler
+      Environment:
+        Variables:
+          CERT_SCANNER_INSTANCE_ID_PARAM: !Ref Ec2CertScannerInstanceIdParam
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${Ec2CertScannerInstanceIdParam}"
+        - Statement:
+            - Effect: Allow
+              Action: ssm:SendCommand
+              Resource:
+                - !Sub "arn:aws:ssm:${AWS::Region}::document/AWS-RunShellScript"
+                - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/${Ec2CertScannerInstance}"
         - Statement:
             - Effect: Allow
               Action:
@@ -1189,6 +1225,137 @@ Resources:
         Enabled: true
 
   # ---------------------------------------------------------------------------
+  # EC2 cert-scanner instance — source for OS-level certificate discovery
+  # ---------------------------------------------------------------------------
+  # No inbound rule at all, SSH included. The spec that requested this instance
+  # asked for port 22 open to 0.0.0.0/0 "or restrict to Lambda security group if
+  # possible" — Lambda isn't VPC-attached here, so there's no such group to
+  # restrict to, and this same instance already gets its remote-access path from
+  # AmazonSSMManagedInstanceCore below (Session Manager, over outbound 443, no
+  # open port needed). Opening 22 to the internet would be pure unused attack
+  # surface, so it's left off; the default egress-allow-all AWS adds when no
+  # SecurityGroupEgress is specified covers apt/SSM/CloudWatch outbound.
+  Ec2CertScannerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: app-d9fae51c-1929cc69-cert-scanner-sg
+      GroupDescription: cert-scanner instance, no inbound, outbound only (SSM/apt)
+      VpcId: vpc-01d3b02b0f1c07aa0
+
+  Ec2CertScannerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: app-d9fae51c-1929cc69-cert-scanner-role
+      PermissionsBoundary: arn:aws:iam::544635841962:policy/brd-architect-deploy-boundary
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        # Grants the cloudwatch:PutMetricData/logs:* the launch UserData below
+        # needs to write the launch-success entry — no separate inline policy
+        # required for that.
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+
+  Ec2CertScannerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: app-d9fae51c-1929cc69-cert-scanner-profile
+      Roles:
+        - !Ref Ec2CertScannerRole
+
+  Ec2CertScannerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: app-d9fae51c-1929cc69-ec2-cert-scanner
+      RetentionInDays: 30
+
+  Ec2CertScannerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref UbuntuAmiId
+      InstanceType: t3.micro
+      SubnetId: subnet-0f43b5569d97d4bda
+      SecurityGroupIds:
+        - !Ref Ec2CertScannerSecurityGroup
+      IamInstanceProfile: !Ref Ec2CertScannerInstanceProfile
+      MetadataOptions:
+        HttpTokens: required
+        HttpPutResponseHopLimit: 2
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 20
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: app-d9fae51c-1929cc69-cert-scanner
+        - Key: Environment
+          Value: hackathon-prototype
+      # Plain Fn::Base64, not Fn::Sub — every value the script needs (region,
+      # log group name) is a literal chosen in this template, so there's no
+      # need to fight Fn::Sub's ${...} escaping against bash's own ${...}
+      # syntax (IMDSv2 token, instance id, public IP).
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+
+          # SSM Agent ships pre-installed (as a snap) on the Ubuntu 22.04 AMI —
+          # just make sure it's enabled and running.
+          systemctl enable snap.amazon-ssm-agent.amazon-ssm-agent.service || true
+          systemctl start snap.amazon-ssm-agent.amazon-ssm-agent.service || true
+
+          apt-get update -y
+          apt-get install -y awscli
+
+          TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+            -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+          INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+            http://169.254.169.254/latest/meta-data/instance-id)
+          PUBLIC_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+            http://169.254.169.254/latest/meta-data/public-ipv4 || echo none)
+
+          REGION="ap-southeast-1"
+          LOG_GROUP="app-d9fae51c-1929cc69-ec2-cert-scanner"
+          LOG_STREAM="launch-$INSTANCE_ID"
+
+          CERTS_DIR_STATUS="missing"
+          [ -d /etc/ssl/certs ] && CERTS_DIR_STATUS="present"
+
+          aws logs create-log-stream --region "$REGION" \
+            --log-group-name "$LOG_GROUP" --log-stream-name "$LOG_STREAM" 2>/dev/null || true
+
+          TS=$(($(date +%s%N)/1000000))
+          MESSAGE="cert-scanner instance launched successfully: instance-id=$INSTANCE_ID public-ip=$PUBLIC_IP /etc/ssl/certs=$CERTS_DIR_STATUS"
+          aws logs put-log-events --region "$REGION" \
+            --log-group-name "$LOG_GROUP" --log-stream-name "$LOG_STREAM" \
+            --log-events "[{\"timestamp\": $TS, \"message\": \"$MESSAGE\"}]" || true
+
+  Ec2CertScannerInstanceIdParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /app-d9fae51c-1929cc69/ec2/cert-scanner-instance-id
+      Type: String
+      Value: !Ref Ec2CertScannerInstance
+      Description: Instance id of the cert-scanner EC2 instance.
+
+  Ec2CertScannerPrivateIpParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /app-d9fae51c-1929cc69/ec2/cert-scanner-private-ip
+      Type: String
+      Value: !GetAtt Ec2CertScannerInstance.PrivateIp
+      Description: Private IP of the cert-scanner EC2 instance.
+
+  # ---------------------------------------------------------------------------
   # EventBridge schedules
   # ---------------------------------------------------------------------------
   EventBridgeSfnRole:
@@ -1241,6 +1408,25 @@ Resources:
       Principal: events.amazonaws.com
       SourceArn: !GetAtt ExpiryScheduleRule.Arn
 
+  Ec2DiscoveryScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: app-d9fae51c-1929cc69-ec2-discovery-30min
+      Description: Trigger EC2 OS certificate discovery every 30 minutes
+      ScheduleExpression: rate(30 minutes)
+      State: ENABLED
+      Targets:
+        - Id: Ec2DiscoveryFunctionTarget
+          Arn: !GetAtt Ec2DiscoveryFunction.Arn
+
+  Ec2DiscoveryInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref Ec2DiscoveryFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt Ec2DiscoveryScheduleRule.Arn
+
 Outputs:
   AppUrl:
     Description: Self-service UI (CloudFront)
@@ -1264,3 +1450,9 @@ Outputs:
     Value: !Ref AuditHotTable
   PasswordResetRequestsTableName:
     Value: !Ref PasswordResetRequestsTable
+  CertScannerInstanceId:
+    Description: EC2 cert-scanner instance id (also in SSM Parameter Store)
+    Value: !Ref Ec2CertScannerInstance
+  CertScannerPublicIp:
+    Description: EC2 cert-scanner public IP (SSM Session Manager; no SSH is open)
+    Value: !GetAtt Ec2CertScannerInstance.PublicIp

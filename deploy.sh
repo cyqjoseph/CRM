@@ -109,6 +109,15 @@ aws lambda invoke --function-name app-d9fae51c-1929cc69-discovery-acm-fn \
   /tmp/discovery-acm-invoke.json \
   || echo "warning: discovery-acm-fn invocation failed — cert-inventory may be empty until the next scheduled run" >&2
 
+# --- Confirm the EC2 OS-certificate discovery path works once, right after deploy ---
+# Same reasoning as above: don't wait for Ec2DiscoveryScheduleRule's first
+# 30-minute tick to find out the SSM dispatch is broken. A failure here must
+# never fail the deploy — the schedule retries on its own.
+aws lambda invoke --function-name app-d9fae51c-1929cc69-ec2-discovery-fn \
+  --region "$REGION" --cli-binary-format raw-in-base64-out --payload '{}' \
+  /tmp/ec2-discovery-invoke.json \
+  || echo "warning: ec2-discovery-fn invocation failed — it will retry on the next 30-minute schedule" >&2
+
 # --- Seed demo inventory rows the UI can render and act on ---------------------
 # Discovery and the API disagree about what OwnerId means: discovery derives it
 # from an IAM path or a resource tag, while GET /certs and GET /iam/accounts

@@ -60,6 +60,24 @@ return `202` with an `executionArn` the moment the state machine starts. The
 outcome arrives only from `GET /executions/{executionArn}`, which the UI polls to
 a terminal state — see *Renew and rotate report their outcome* below.
 
+**EC2 OS-certificate discovery.** A single `t3.micro` Ubuntu 22.04 instance
+(`Ec2CertScannerInstance`, tag `Name=app-d9fae51c-1929cc69-cert-scanner`) is the
+source for OS-level certificate discovery — the certs under its own
+`/etc/ssl/certs`, as distinct from the IAM-server-cert/Secrets-Manager
+inventory `discovery-acm-fn` already covers. `ec2-discovery-fn` runs on
+`Ec2DiscoveryScheduleRule` (`rate(30 minutes)`), reads the instance id from
+`/app-d9fae51c-1929cc69/ec2/cert-scanner-instance-id` in Parameter Store, and
+dispatches an `AWS-RunShellScript` SSM Run Command against it that lists every
+cert's subject and expiry. The instance carries no inbound security-group rule
+at all, SSH included — remote access is `AmazonSSMManagedInstanceCore` /
+Session Manager, over outbound 443, so there's no port to open. (The task that
+requested this instance asked for port 22 open to `0.0.0.0/0` "or restrict to
+Lambda security group if possible"; Lambda isn't VPC-attached anywhere in this
+app, so there's no such group, and SSM already satisfies the same need without
+exposing anything to the internet.) Launch success, instance id and public IP
+are logged to CloudWatch Logs (`app-d9fae51c-1929cc69-ec2-cert-scanner`) by the
+instance's own boot UserData.
+
 All infrastructure is in `template.yaml` (AWS SAM). Shared Lambda code lives in
 `layers/common/python/crm_common/`.
 
@@ -72,8 +90,9 @@ All infrastructure is in `template.yaml` (AWS SAM). Shared Lambda code lives in
 ```
 
 `deploy.sh` is idempotent and writes `outputs.json` (including `app_url`) at the
-repo root. It also invokes both discovery Lambdas once so the tables have data
-immediately instead of waiting for the daily schedule.
+repo root. It also invokes all three discovery Lambdas (`discovery-iam-fn`,
+`discovery-acm-fn`, `ec2-discovery-fn`) once so the tables/logs have data
+immediately instead of waiting for their schedules.
 
 ### Generating demo data
 
