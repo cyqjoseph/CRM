@@ -44,7 +44,6 @@ REQUIRED_ROUTES = {
     ("/iam/accounts/{accountId}", "get"),
     ("/iam/accounts/{accountId}/rotate", "post"),
     ("/executions/{executionId}", "get"),
-    ("/audit", "get"),
     ("/password-resets", "post"),
     ("/password-resets", "get"),
     ("/password-resets/{requestId}/approve", "post"),
@@ -384,7 +383,7 @@ def test_every_state_machine_role_can_actually_write_xray_traces():
         assert not missing, f"{logical_id} enables tracing but cannot write it: {missing}"
 
 
-def test_api_audit_can_describe_every_state_machine_it_is_asked_about():
+def test_api_executions_can_describe_every_state_machine_it_is_asked_about():
     """GET /executions/{executionId} is the UI's only way to learn whether a
     renew/rotate/password-reset actually succeeded.
 
@@ -395,7 +394,7 @@ def test_api_audit_can_describe_every_state_machine_it_is_asked_about():
     statements = [
         statement
         for logical_id, statement in _iter_statements()
-        if logical_id == "ApiAuditFunction"
+        if logical_id == "ApiExecutionsFunction"
     ]
     described = []
     for statement in statements:
@@ -410,7 +409,7 @@ def test_api_audit_can_describe_every_state_machine_it_is_asked_about():
     joined = " ".join(described)
     for name in ("DiscoverySfn", "RenewalSfn", "RotationSfn", "PasswordResetSfn"):
         assert f"${{{name}.Name}}" in joined, (
-            f"api-audit-fn cannot DescribeExecution on {name} — polling one of its "
+            f"api-executions-fn cannot DescribeExecution on {name} — polling one of its "
             "executions returns AccessDenied, which looks like a failed execution"
         )
 
@@ -429,20 +428,27 @@ def test_every_function_agrees_on_the_shared_owner_partition():
     assert ec2_env["OWNER_ID"] == "crm-resource-owners"
 
 
-def test_api_audit_can_check_whether_an_entity_is_a_shared_inventory_resource():
-    """Renewal/rotation events hang off a CertId or AccountIdHash, so without
-    these reads a non-admin could only ever see their own actor events."""
-    props = RESOURCES["ApiAuditFunction"]["Properties"]
-    env = props["Environment"]["Variables"]
-    assert env["CERT_TABLE_NAME"] == {"Fn::Ref": "CertInventoryTable"}
-    assert env["IAM_TABLE_NAME"] == {"Fn::Ref": "IamAccountsTable"}
-    read_tables = [
-        policy["DynamoDBReadPolicy"]["TableName"]
+def test_the_executions_function_reads_no_dynamodb_table_at_all():
+    """It served GET /audit once; with that route withdrawn it needs no table, and
+    a leftover read grant would be permission nobody uses."""
+    props = RESOURCES["ApiExecutionsFunction"]["Properties"]
+    assert "Environment" not in props, "no table names left to configure"
+    assert not any(
+        isinstance(policy, dict) and "DynamoDBReadPolicy" in policy
         for policy in props["Policies"]
-        if isinstance(policy, dict) and "DynamoDBReadPolicy" in policy
-    ]
-    assert {"Fn::Ref": "CertInventoryTable"} in read_tables
-    assert {"Fn::Ref": "IamAccountsTable"} in read_tables
+    )
+
+
+def test_no_audit_search_route_is_exposed():
+    """GET /audit required knowing a resource's exact id, so every search anyone
+    actually typed answered 403. The trail is still written — only the search
+    endpoint is gone."""
+    paths = set()
+    for resource in RESOURCES.values():
+        for event in (resource.get("Properties", {}).get("Events") or {}).values():
+            if event.get("Type") == "Api":
+                paths.add(event["Properties"]["Path"])
+    assert "/audit" not in paths
 
 
 def test_ec2_discovery_scans_the_app_cert_directory_the_instance_writes_to():

@@ -232,7 +232,7 @@
         errorFieldId,
         `${labels.noun} failed (${outcome.status})` +
           (failedState ? ` at ${failedState.type}` : "") +
-          ". Check the audit tab for details."
+          ". The full trail is in CloudWatch Logs and the audit-hot table."
       );
       button.textContent = original;
       button.disabled = false;
@@ -249,7 +249,7 @@
     btn.addEventListener("click", () => {
       document.querySelectorAll(".tab").forEach((b) => b.classList.remove("active"));
       btn.classList.add("active");
-      ["certs", "iam", "audit", "password-resets"].forEach((t) => {
+      ["certs", "iam", "password-resets"].forEach((t) => {
         el(`tab-${t}`).classList.toggle("hidden", t !== btn.dataset.tab);
       });
       if (btn.dataset.tab === "certs") loadCerts();
@@ -466,41 +466,6 @@
   }
 
   el("resetFilterSearch").addEventListener("click", loadPasswordResets);
-
-  // --- Audit ---
-
-  // Detail is a DynamoDB map (crm_common.put_audit_event writes a dict, and the
-  // Step Functions putItem states write one too), so interpolating it directly
-  // renders the literal string "[object Object]" for every row.
-  function formatDetail(detail) {
-    if (!detail) return "";
-    if (typeof detail === "string") return detail;
-    return Object.entries(detail)
-      .map(([k, v]) => `${k}: ${typeof v === "object" ? JSON.stringify(v) : v}`)
-      .join(", ");
-  }
-
-  el("auditSearch").addEventListener("click", async () => {
-    setError("auditError", null);
-    const entityId = el("auditEntityId").value.trim();
-    if (!entityId) return setError("auditError", "Enter an entity ID first.");
-    try {
-      const data = await apiFetch(`/audit?entityId=${encodeURIComponent(entityId)}`, { method: "GET" });
-      const rows = (data.items || [])
-        .map(
-          (e) => `<tr>
-            <td>${e.EventTimestamp}</td>
-            <td>${e.EventType}</td>
-            <td>${e.Outcome}</td>
-            <td>${formatDetail(e.Detail)}</td>
-          </tr>`
-        )
-        .join("");
-      el("auditBody").innerHTML = rows || `<tr><td colspan="4">No audit events found.</td></tr>`;
-    } catch (err) {
-      setError("auditError", err.message);
-    }
-  });
 
   renderAuthMode();
 })();

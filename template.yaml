@@ -830,30 +830,23 @@ Resources:
             Path: /iam/accounts/{accountId}/rotate
             Method: post
 
-  ApiAuditFunction:
+  # Serves GET /executions/{executionId} only. The audit-search route this
+  # function used to expose (GET /audit) is withdrawn: it required the caller to
+  # already know a resource's exact id, so every search a person actually typed
+  # — a prefix like "demo-cert" — matched nothing and, being unresolvable, was
+  # refused as a cross-owner lookup. It answered 403 to real use.
+  #
+  # The audit TRAIL is untouched: the state machines and put_audit_event still
+  # write every action to AuditHotTable and audit-exporter-fn still archives it.
+  # Only the search endpoint is gone, which is why this function no longer reads
+  # any DynamoDB table at all.
+  ApiExecutionsFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: app-d9fae51c-1929cc69-api-audit-fn
-      CodeUri: functions/api_audit/
+      FunctionName: app-d9fae51c-1929cc69-api-executions-fn
+      CodeUri: functions/api_executions/
       Handler: app.handler
-      Environment:
-        Variables:
-          AUDIT_TABLE_NAME: !Ref AuditHotTable
-          # Read-only, and used for one question: is this entityId a certificate or
-          # account in the shared inventory? Renewal and rotation events hang off a
-          # CertId/AccountIdHash, so without this lookup the audit tab could only
-          # ever show a caller their own actor events — and the "check the audit tab
-          # for details" the UI prints after a failed renewal was advice only an
-          # admin could act on.
-          CERT_TABLE_NAME: !Ref CertInventoryTable
-          IAM_TABLE_NAME: !Ref IamAccountsTable
       Policies:
-        - DynamoDBReadPolicy:
-            TableName: !Ref AuditHotTable
-        - DynamoDBReadPolicy:
-            TableName: !Ref CertInventoryTable
-        - DynamoDBReadPolicy:
-            TableName: !Ref IamAccountsTable
         - Statement:
             - Effect: Allow
               Action:
@@ -874,12 +867,6 @@ Resources:
                 - logs:DescribeLogStreams
               Resource: "*"
       Events:
-        GetAudit:
-          Type: Api
-          Properties:
-            RestApiId: !Ref CrmApi
-            Path: /audit
-            Method: get
         GetExecution:
           Type: Api
           Properties:

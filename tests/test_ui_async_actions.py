@@ -52,7 +52,7 @@ def test_the_poller_is_bounded():
 
 
 def test_error_bodies_are_read_from_error_and_details_not_only_message():
-    """api-audit-fn/api-certs-fn return {error, details} when they catch a
+    """api-executions-fn/api-certs-fn return {error, details} when they catch a
     specific AWS call; guard_api_handler returns {message}.
 
     Reading only `message` discarded `details` — the field holding the actual

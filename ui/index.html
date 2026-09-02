@@ -39,7 +39,6 @@
       <div class="tabs">
         <button class="tab active" data-tab="certs">Certificates</button>
         <button class="tab" data-tab="iam">IAM Accounts</button>
-        <button class="tab" data-tab="audit">Audit</button>
         <button class="tab hidden" data-tab="password-resets" id="passwordResetsTab">Password Resets</button>
       </div>
 
@@ -64,18 +63,6 @@
             <tr><th>User</th><th>Account</th><th>Next rotation</th><th>Status</th><th></th></tr>
           </thead>
           <tbody id="iamBody"></tbody>
-        </table>
-      </div>
-
-      <div id="tab-audit" class="card hidden">
-        <input id="auditEntityId" placeholder="Entity ID (cert ID or account hash)" />
-        <button class="action" id="auditSearch">Search</button>
-        <div id="auditError" class="error hidden" style="margin-top:10px;"></div>
-        <table>
-          <thead>
-            <tr><th>Timestamp</th><th>Event</th><th>Outcome</th><th>Detail</th></tr>
-          </thead>
-          <tbody id="auditBody"></tbody>
         </table>
       </div>
 

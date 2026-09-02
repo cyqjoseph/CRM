@@ -1,48 +1,17 @@
+"""api-executions-fn: GET /executions/{executionId}.
+
+The GET /audit tests that used to live here are gone with the route. It required
+the caller to already know a resource's exact id, so every search a person
+actually typed — a prefix like "demo-cert" — matched nothing and was refused as an
+unresolvable cross-owner lookup. The audit trail itself still gets written; only
+the search endpoint is withdrawn.
+"""
 import json
 from unittest.mock import MagicMock, patch
 
 from conftest import load_module
 
-app = load_module("api_audit_app", "functions/api_audit/app.py")
-
-
-def _event(entity_id, claims):
-    return {
-        "resource": "/audit",
-        "pathParameters": None,
-        "queryStringParameters": {"entityId": entity_id},
-        "requestContext": {"authorizer": {"claims": claims}},
-    }
-
-
-@patch("boto3.resource")
-def test_non_admin_cannot_query_another_owners_entity(mock_resource):
-    response = app.handler(_event("someone-elses-entity", {"sub": "owner-1"}), None)
-    assert response["statusCode"] == 403
-    mock_resource.return_value.Table.return_value.query.assert_not_called()
-
-
-@patch("boto3.resource")
-def test_non_admin_can_query_their_own_entity(mock_resource):
-    table = MagicMock()
-    table.query.return_value = {"Items": []}
-    mock_resource.return_value.Table.return_value = table
-
-    response = app.handler(_event("owner-1", {"sub": "owner-1"}), None)
-    assert response["statusCode"] == 200
-    assert table.query.called
-
-
-@patch("boto3.resource")
-def test_admin_can_query_any_entity(mock_resource):
-    table = MagicMock()
-    table.query.return_value = {"Items": []}
-    mock_resource.return_value.Table.return_value = table
-
-    claims = {"sub": "owner-1", "cognito:groups": "admins"}
-    response = app.handler(_event("someone-elses-entity", claims), None)
-    assert response["statusCode"] == 200
-    assert table.query.called
+app = load_module("api_executions_app", "functions/api_executions/app.py")
 
 
 def _execution_event(execution_id, claims):
@@ -167,92 +136,3 @@ def test_a_missing_execution_id_is_a_400_not_a_500(mock_client, mock_resource):
     assert response["statusCode"] == 400
     sfn.describe_execution.assert_not_called()
 
-
-# --- Shared team visibility --------------------------------------------------
-#
-# Renewal and rotation events hang off a CertId/AccountIdHash, not off the
-# clicker's sub. Scoping non-admins to their own actor id alone meant the
-# "check the audit tab for details" the UI prints after a failed renewal was
-# advice only an admin could act on.
-
-from crm_common import SHARED_OWNER_ID  # noqa: E402
-
-
-def _tables(cert_item=None, iam_item=None, audit_items=None):
-    """Route boto3.resource().Table(name) to a per-table stub."""
-    audit = MagicMock()
-    audit.query.return_value = {"Items": audit_items or []}
-    certs = MagicMock()
-    certs.get_item.return_value = {"Item": cert_item} if cert_item else {}
-    iam = MagicMock()
-    iam.get_item.return_value = {"Item": iam_item} if iam_item else {}
-
-    def table_for(name):
-        if name == app.CERT_TABLE_NAME:
-            return certs
-        if name == app.IAM_TABLE_NAME:
-            return iam
-        return audit
-
-    resource = MagicMock()
-    resource.Table.side_effect = table_for
-    return resource, audit
-
-
-@patch("boto3.resource")
-def test_any_login_can_read_the_shared_partitions_trail(mock_resource):
-    resource, audit = _tables()
-    mock_resource.return_value = resource
-
-    response = app.handler(_event(SHARED_OWNER_ID, {"sub": "sub-b"}), None)
-
-    assert response["statusCode"] == 200
-    assert audit.query.called
-
-
-@patch("boto3.resource")
-def test_any_login_can_read_the_trail_of_a_shared_certificate(mock_resource):
-    resource, audit = _tables(cert_item={"CertId": "ec2-aaa", "OwnerId": SHARED_OWNER_ID})
-    mock_resource.return_value = resource
-
-    response = app.handler(_event("ec2-aaa", {"sub": "sub-b"}), None)
-
-    assert response["statusCode"] == 200
-    assert audit.query.called
-
-
-@patch("boto3.resource")
-def test_any_login_can_read_the_trail_of_a_shared_account(mock_resource):
-    resource, audit = _tables(iam_item={"AccountIdHash": "demo-acct-1", "OwnerId": SHARED_OWNER_ID})
-    mock_resource.return_value = resource
-
-    response = app.handler(_event("demo-acct-1", {"sub": "sub-b"}), None)
-
-    assert response["statusCode"] == 200
-    assert audit.query.called
-
-
-@patch("boto3.resource")
-def test_the_trail_of_a_cert_owned_by_another_login_is_still_forbidden(mock_resource):
-    resource, audit = _tables(cert_item={"CertId": "theirs", "OwnerId": "sub-c"})
-    mock_resource.return_value = resource
-
-    response = app.handler(_event("theirs", {"sub": "sub-b"}), None)
-
-    assert response["statusCode"] == 403
-    audit.query.assert_not_called()
-
-
-@patch("boto3.resource")
-def test_a_failing_inventory_lookup_falls_back_to_forbidden_rather_than_500(mock_resource):
-    resource, audit = _tables()
-    resource.Table.side_effect = None
-    failing = MagicMock()
-    failing.get_item.side_effect = Exception("AccessDeniedException")
-    failing.query.return_value = {"Items": []}
-    resource.Table.return_value = failing
-    mock_resource.return_value = resource
-
-    response = app.handler(_event("unknown-entity", {"sub": "sub-b"}), None)
-
-    assert response["statusCode"] == 403

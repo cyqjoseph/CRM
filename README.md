@@ -40,7 +40,7 @@ CloudFront ──> S3 (static UI)          EventBridge (daily / hourly)
                                     │                                              └──> DLQ
         ┌───────────────────────────┼───────────────────────────┐
         │              │            │             │             │
-   api-certs-fn   api-iam-fn   api-audit-fn  api-password-  api-health-fn
+   api-certs-fn   api-iam-fn   api-executions-fn   api-password-  api-health-fn
         │              │            │         resets-fn      (unauthenticated)
         │              │            │             │
    renewal-sfn    rotation-sfn      │      password-reset-approver-fn
@@ -271,6 +271,33 @@ Two traps still make hand-seeding error-prone: `ExpiryDate` and
 item lacking one from the index (accepted on write, never returned by
 `GET /certs`); and the IAM tab renders `Status` and `UserName`, not
 `RotationStatus`.
+
+### There is no audit search endpoint
+
+`GET /audit` was withdrawn, along with the Audit tab. It queried the audit table
+by `EntityId` — the table's HASH key — which means it only ever worked if you
+already knew a resource's exact id. A prefix like `demo-cert` matched nothing,
+and because an unresolvable id cannot be shown to belong to the shared inventory,
+it was refused as a cross-owner lookup. In other words it answered `403 forbidden`
+to every search a person would actually type, and `200` with an empty list to the
+one nobody would.
+
+What remains:
+
+- the **trail is still written** — the four state machines and
+  `crm_common.put_audit_event` record every discovery, alert, renewal, rotation
+  and password reset to `app-d9fae51c-1929cc69-audit-hot`, and
+  `audit-exporter-fn` still archives it to S3 off the table's stream
+- `GET /executions/{executionId}` survives, in `api-executions-fn` (the same
+  Lambda, renamed for what it now does). This is **not** optional: Renew and
+  Rotate return 202 the moment the state machine starts, and this endpoint is how
+  the UI learns whether the work actually succeeded. Deleting it would leave every
+  button reporting "started, but checking its status failed"
+
+Reading the trail is a console job now: the `audit-hot` table, or the
+`/aws/lambda/app-d9fae51c-1929cc69-*` log groups. A search UI worth having would
+need a GSI on something people can actually search by — a timestamp range, or an
+actor — rather than exact-id lookups on the primary key.
 
 ### `Status` has one vocabulary, and it agrees with the date
 

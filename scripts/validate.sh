@@ -114,21 +114,10 @@ for path in /certs /iam/accounts; do
   pass "GET $path -> 200, $(printf '%s' "$JSON" | jq '.items | length') item(s)"
 done
 
-# /audit requires entityId; a non-admin may only query their own actor id.
-AUDIT_STATUS="$(curl -s -o /dev/null -w '%{http_code}' \
-  "$API_URL/audit?entityId=$USER_SUB" -H "Authorization: $ID_TOKEN")"
-[ "$AUDIT_STATUS" = "200" ] || fail "GET /audit?entityId=<own sub> -> $AUDIT_STATUS (expected 200)"
-pass "GET /audit?entityId=<own sub> -> 200"
-
-MISSING_STATUS="$(curl -s -o /dev/null -w '%{http_code}' \
-  "$API_URL/audit" -H "Authorization: $ID_TOKEN")"
-[ "$MISSING_STATUS" = "400" ] || fail "GET /audit with no entityId -> $MISSING_STATUS (expected 400)"
-pass "GET /audit without entityId -> 400"
-
-FORBIDDEN_STATUS="$(curl -s -o /dev/null -w '%{http_code}' \
-  "$API_URL/audit?entityId=someone-elses-id" -H "Authorization: $ID_TOKEN")"
-[ "$FORBIDDEN_STATUS" = "403" ] || fail "cross-owner /audit -> $FORBIDDEN_STATUS (expected 403)"
-pass "cross-owner /audit as a non-admin -> 403 (owner scoping enforced)"
+# GET /audit is gone — it required knowing a resource's exact id, so every search
+# anyone actually typed answered 403. The trail is still written to audit-hot and
+# archived to S3; there is just no search endpoint to probe here any more.
+# /executions/{executionId} is exercised by the renew step below.
 
 step "7. Seed a certificate owned by this user, then read it back"
 # GET /certs reads the shared team partition PLUS the caller's own sub, so a row

@@ -22,7 +22,7 @@ from conftest import load_module
 API_MODULES = {
     "certs": ("api_certs_err", "functions/api_certs/app.py"),
     "iam": ("api_iam_err", "functions/api_iam/app.py"),
-    "audit": ("api_audit_err", "functions/api_audit/app.py"),
+    "executions": ("api_executions_err", "functions/api_executions/app.py"),
     "password_resets": ("api_password_resets_err", "functions/api_password_resets/app.py"),
     "password_reset_approver": ("password_reset_approver_err", "functions/password_reset_approver/app.py"),
 }
@@ -30,7 +30,7 @@ API_MODULES = {
 EVENTS = {
     "certs": {"httpMethod": "GET", "resource": "/certs"},
     "iam": {"httpMethod": "GET", "resource": "/iam/accounts"},
-    "audit": {"httpMethod": "GET", "resource": "/audit"},
+    "executions": {"httpMethod": "GET", "resource": "/executions/{executionId}"},
     "password_resets": {"httpMethod": "POST", "resource": "/password-resets"},
     "password_reset_approver": {"httpMethod": "POST", "resource": "/password-resets/{requestId}/approve"},
 }
@@ -39,7 +39,11 @@ EVENTS = {
 def _event(name):
     event = dict(EVENTS[name])
     event["pathParameters"] = {"requestId": "r1"} if name == "password_reset_approver" else None
-    event["queryStringParameters"] = {"entityId": "owner-1"} if name == "audit" else None
+    event["queryStringParameters"] = None
+    if name == "executions":
+        # This handler reaches AWS only for a well-formed ARN; anything else is a
+        # 400 it returns itself, which would never exercise the 500 path.
+        event["pathParameters"] = {"executionId": "arn:aws:states:ap-southeast-1:1:execution:sfn:x"}
     claims = {"sub": "admin-1", "cognito:groups": "admins"} if name == "password_reset_approver" else {"sub": "owner-1"}
     event["requestContext"] = {"authorizer": {"claims": claims}}
     if name == "password_resets":

@@ -181,8 +181,9 @@ def test_account_ids_and_usernames_are_unique():
 
 
 def test_audit_events_hang_off_the_owner_sub_not_a_cert_id():
-    """api-audit-fn lets a non-admin query only their own sub, so events keyed on
-    a CertId are invisible to a normal login."""
+    """Keyed on one owner id so the seeded trail sits in a single partition —
+    readable in the console, and something for the TTL and the exporter to act on.
+    There is no audit search endpoint any more."""
     for item in gen.build_audit_events(OWNER, 30, _rng()):
         assert item["EntityId"]["S"] == OWNER
 

@@ -235,12 +235,12 @@ def build_accounts(owner_id, count, rng):
 
 
 def build_audit_events(owner_id, count, rng, ttl_days=90):
-    """Events keyed on the owner's sub.
+    """Events keyed on the owner id, so the seeded trail sits in one partition.
 
-    The Audit tab searches by entity id, and api-audit-fn lets a non-admin query
-    only their own sub — so events hung off a CertId are visible to admins alone.
-    Seeding against the sub is what makes the tab show anything for a normal
-    login.
+    There is no audit search endpoint any more (it answered 403 to every search
+    anyone actually typed), so these rows exist to give audit-exporter-fn and the
+    TTL something real to work on, and to make the table legible to whoever opens
+    it in the console.
     """
     expires_at = int(datetime.now(timezone.utc).timestamp()) + ttl_days * 86400
     items = []
