@@ -266,6 +266,29 @@
     return "status-ok";
   }
 
+  // An already-expired certificate rendered as "(-31d)" reads like a bug in the
+  // data rather than a certificate that lapsed a month ago.
+  function expiryLabel(expiryDate, daysLeft) {
+    if (!expiryDate) return "unknown";
+    if (daysLeft < 0) return `${expiryDate} (expired ${Math.abs(daysLeft)}d ago)`;
+    if (daysLeft === 0) return `${expiryDate} (expires today)`;
+    return `${expiryDate} (${daysLeft}d)`;
+  }
+
+  // Certificates now arrive from several places at once: signed by the scanner
+  // instance's own internal CA, read out of its OS trust store, or seeded. Without
+  // this column ~50 root CAs are indistinguishable from the application
+  // certificates the dashboard exists to track.
+  const CERT_TYPE_LABELS = {
+    EC2_APP_CERT: "App (EC2)",
+    EC2_SYSTEM_CA: "System CA",
+    IAM_SERVER_CERT: "IAM",
+    SELF_SIGNED: "Self-signed",
+    "Self-Signed": "Self-signed",
+    "On-Prem": "On-prem",
+    ACM: "ACM",
+  };
+
   async function loadCerts() {
     setError("certsError", null);
     try {
@@ -273,16 +296,18 @@
       const rows = (data.items || [])
         .map((c) => {
           const days = Math.ceil((new Date(c.ExpiryDate) - new Date()) / 86400000);
+          const type = CERT_TYPE_LABELS[c.CertType] || c.CertType || "";
           return `<tr>
             <td>${c.CertId}</td>
             <td>${c.Domain || ""}</td>
-            <td class="${statusClass(days)}">${c.ExpiryDate} (${days}d)</td>
+            <td>${type}</td>
+            <td class="${statusClass(days)}">${expiryLabel(c.ExpiryDate, days)}</td>
             <td>${c.Status || ""}</td>
             <td><button class="action" data-cert="${c.CertId}">Renew</button></td>
           </tr>`;
         })
         .join("");
-      el("certsBody").innerHTML = rows || `<tr><td colspan="5">No certificates found.</td></tr>`;
+      el("certsBody").innerHTML = rows || `<tr><td colspan="6">No certificates found.</td></tr>`;
       el("certsBody").querySelectorAll("button[data-cert]").forEach((b) => {
         b.addEventListener("click", () => renewCert(b.dataset.cert, b));
       });

@@ -5,7 +5,9 @@ import traceback
 
 import boto3
 from crm_common import (
+    SHARED_OWNER_ID,
     api_response,
+    can_view,
     get_claims,
     guard_api_handler,
     is_admin,
@@ -13,10 +15,12 @@ from crm_common import (
     now_iso,
     owner_id_of,
     put_audit_event,
+    query_owner_partitions,
     request_headers,
     request_origin,
     sanitize_event_for_logging,
     structured_log,
+    visible_owner_ids,
 )
 
 IAM_TABLE_NAME = os.environ["IAM_TABLE_NAME"]
@@ -24,28 +28,28 @@ ROTATION_STATE_MACHINE_ARN = os.environ["ROTATION_STATE_MACHINE_ARN"]
 
 
 def _list_accounts(table, claims, query_params, request_id):
+    """Every account this caller may see: the shared team inventory, plus
+    anything still owned by their own Cognito sub. Same reasoning as
+    api-certs-fn's _list_certs."""
     query_params = query_params or {}
-    if is_admin(claims) and query_params.get("ownerId"):
-        owner_id = query_params["ownerId"]
-    else:
-        owner_id = owner_id_of(claims)
+    owner_override = query_params.get("ownerId") if is_admin(claims) else None
 
-    structured_log(
-        request_id, "query_params", function="api-iam", table=IAM_TABLE_NAME,
-        action="query_all_accounts", ownerId=owner_id, status=query_params.get("status"),
-    )
-
-    if not owner_id:
+    if not owner_id_of(claims):
         # An empty string is not a valid DynamoDB key value; without this the
         # query raises ValidationException and API Gateway reports a 502.
         structured_log(request_id, "unauthenticated", level="WARN", function="api-iam")
         return api_response(401, {"message": "unauthenticated"})
 
+    owner_ids = [owner_override] if owner_override else visible_owner_ids(claims)
+    structured_log(
+        request_id, "query_params", function="api-iam", table=IAM_TABLE_NAME,
+        action="query_all_accounts", ownerIds=owner_ids, sharedOwnerId=SHARED_OWNER_ID,
+        status=query_params.get("status"),
+    )
+
     try:
-        response = table.query(
-            IndexName="OwnerIndex",
-            KeyConditionExpression="OwnerId = :owner",
-            ExpressionAttributeValues={":owner": owner_id},
+        items = query_owner_partitions(
+            table, "OwnerIndex", "AccountIdHash", claims, owner_id_override=owner_override
         )
     except Exception:
         structured_log(
@@ -54,7 +58,6 @@ def _list_accounts(table, claims, query_params, request_id):
         )
         raise
 
-    items = response.get("Items", [])
     structured_log(
         request_id, "dynamodb_response", function="api-iam", table=IAM_TABLE_NAME,
         count=len(items), firstItem=items[0] if items else None,
@@ -62,6 +65,7 @@ def _list_accounts(table, claims, query_params, request_id):
 
     if query_params.get("status"):
         items = [i for i in items if i.get("Status") == query_params["status"]]
+    items.sort(key=lambda i: str(i.get("NextRotationDate") or ""))
     return api_response(200, {"items": items})
 
 
@@ -79,7 +83,7 @@ def _get_account(table, claims, account_id, request_id):
     structured_log(request_id, "dynamodb_response", function="api-iam", table=IAM_TABLE_NAME, found=item is not None)
     if not item:
         return api_response(404, {"message": "not found"})
-    if not is_admin(claims) and item.get("OwnerId") != owner_id_of(claims):
+    if not can_view(item, claims):
         return api_response(404, {"message": "not found"})
     return api_response(200, item)
 
@@ -90,7 +94,7 @@ def _rotate_account(table, claims, account_id, request_id):
     item = response.get("Item")
     if not item:
         return api_response(404, {"message": "not found"})
-    if not is_admin(claims) and item.get("OwnerId") != owner_id_of(claims):
+    if not can_view(item, claims):
         return api_response(404, {"message": "not found"})
 
     # Same isolated try/except as api-certs-fn's renew path: a StartExecution

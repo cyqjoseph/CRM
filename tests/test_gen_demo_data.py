@@ -6,11 +6,15 @@ below and simply returns fewer rows than expected:
   - A row missing the GSI's RANGE key (ExpiryDate / NextRotationDate) is written
     successfully and then omitted from the index entirely, so GET /certs never
     returns it.
-  - `OwnerId` must be the caller's Cognito sub; OwnerIndex is keyed on it, so any
-    other value makes the row invisible to every login.
+  - `OwnerId` is OwnerIndex's HASH key, so its value decides which logins can see
+    the row. Seeding it with one Cognito sub gave that member a private dashboard
+    and showed every other member nothing; rows go to the shared team partition.
   - `Status` is the HASH key of ExpiryIndex/StatusIndex and expiry-evaluator-fn
     queries those with the literals "ISSUED" and "active". Any other value is
     invisible to the alerting path.
+  - A `Status` picked independently of `ExpiryDate` produces rows reading
+    "ISSUED" that expired months ago, and an inventory that can never show a
+    single expired certificate.
   - BatchWriteItem's 25-item cap is per REQUEST, across all tables in the
     payload, not per table. Exceeding it fails the whole call.
 """
@@ -25,9 +29,11 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
+from conftest import load_module  # noqa: E402
+
 import gen_demo_data as gen  # noqa: E402
 
-OWNER = "d9ca551c-d0a1-7011-1c4f-99a48c8d917f"
+OWNER = gen.SHARED_OWNER_ID
 
 
 def _rng():
@@ -59,25 +65,50 @@ def test_cert_domains_are_unique_so_rows_are_distinguishable_in_the_ui():
     assert len(set(domains)) == len(domains)
 
 
-def test_expiry_dates_cover_every_colour_band():
-    """Seeding must exercise the UI's rendering, not just its query. The bands
-    are <=7d red, <=30d amber, beyond green."""
+def _days_left(item):
     from datetime import date
 
-    items = gen.build_certs(OWNER, 12, _rng())
-    days = [(date.fromisoformat(i["ExpiryDate"]["S"]) - date.today()).days for i in items]
-    assert any(d <= 7 for d in days), f"no red-band cert: {days}"
+    return (date.fromisoformat(item["ExpiryDate"]["S"]) - date.today()).days
+
+
+def test_expiry_dates_cover_every_band_including_already_expired():
+    """Seeding must exercise the UI's rendering, not just its query: expired,
+    <=7d red, <=30d amber, beyond green."""
+    items = gen.build_certs(OWNER, 16, _rng())
+    days = [_days_left(i) for i in items]
+    assert any(d < 0 for d in days), f"no expired cert: {days}"
+    assert any(0 <= d <= 7 for d in days), f"no red-band cert: {days}"
     assert any(7 < d <= 30 for d in days), f"no amber-band cert: {days}"
     assert any(d > 30 for d in days), f"no green-band cert: {days}"
 
 
-def test_expiry_dates_are_in_the_future():
-    """A hardcoded date silently ages into the past and renders every row as
-    long expired — the bug the previous fixed seed had."""
-    from datetime import date
-
+def test_every_date_is_relative_to_today_so_a_seed_can_never_age():
+    """A hardcoded date silently ages into the past and renders every row as long
+    expired — the bug the original fixed seed had. Every date must stay inside the
+    window the bands describe, measured from today."""
+    lowest = min(low for _, low, _ in gen.BANDS)
+    highest = max(high for _, _, high in gen.BANDS)
     for item in gen.build_certs(OWNER, 40, _rng()):
-        assert date.fromisoformat(item["ExpiryDate"]["S"]) > date.today()
+        assert lowest <= _days_left(item) <= highest
+
+
+def test_status_always_agrees_with_the_expiry_date():
+    """The reported inconsistency: rows reading "ISSUED" that expire tomorrow, and
+    a status picked at random independently of the date."""
+    for item in gen.build_certs(OWNER, 80, _rng()):
+        days = _days_left(item)
+        status = item["Status"]["S"]
+        if days < 0:
+            assert status == gen.CERT_EXPIRED_STATUS, f"{item['CertId']['S']} expired {days}d ago but reads {status}"
+        else:
+            assert status != gen.CERT_EXPIRED_STATUS, f"{item['CertId']['S']} expires in {days}d but reads EXPIRED"
+
+
+def test_no_certificate_awaiting_validation_is_also_about_to_expire():
+    """PENDING_VALIDATION means not yet issued, so it cannot be days from expiry."""
+    for item in gen.build_certs(OWNER, 80, _rng()):
+        if item["Status"]["S"] == gen.CERT_PENDING_STATUS:
+            assert _days_left(item) > 30, item["CertId"]["S"]
 
 
 def test_most_certs_are_alertable_but_some_deliberately_are_not():
@@ -86,6 +117,29 @@ def test_most_certs_are_alertable_but_some_deliberately_are_not():
     alertable = statuses.count(gen.CERT_ALERTABLE_STATUS)
     assert alertable > len(statuses) / 2, "most rows must be queryable by ExpiryIndex"
     assert alertable < len(statuses), "some rows must be excluded, to prove the filter works"
+
+
+def test_every_non_alertable_status_is_actually_represented():
+    statuses = {i["Status"]["S"] for i in gen.build_certs(OWNER, 80, _rng())}
+    for status in gen.CERT_OTHER_STATUSES:
+        assert status in statuses, f"{status} never generated — the UI never renders it"
+
+
+def test_the_status_literals_match_the_ones_every_lambda_uses():
+    """gen_demo_data.py duplicates these rather than importing crm_common (it is
+    stdlib-only by design), so the copies have to be checked against the source."""
+    crm_common = load_module("crm_common_for_gen", "layers/common/python/crm_common/__init__.py")
+    assert gen.CERT_ALERTABLE_STATUS == crm_common.CERT_STATUS_ISSUED
+    assert gen.CERT_EXPIRED_STATUS == crm_common.CERT_STATUS_EXPIRED
+    assert gen.CERT_REVOKED_STATUS == crm_common.CERT_STATUS_REVOKED
+    assert gen.CERT_PENDING_STATUS == crm_common.CERT_STATUS_PENDING_VALIDATION
+
+
+def test_the_default_owner_is_the_shared_partition_every_login_can_read():
+    crm_common = load_module("crm_common_for_gen_owner", "layers/common/python/crm_common/__init__.py")
+    assert gen.SHARED_OWNER_ID == crm_common.SHARED_OWNER_ID
+    for item in gen.build_certs(gen.SHARED_OWNER_ID, 5, _rng()):
+        assert item["OwnerId"]["S"] == crm_common.SHARED_OWNER_ID
 
 
 # --- IAM accounts ------------------------------------------------------------
@@ -100,6 +154,21 @@ def test_every_account_carries_both_index_keys_and_the_ui_columns():
         # and rotation.asl.json writes back to `Status`.
         assert item["UserName"]["S"]
         assert "RotationStatus" not in item
+
+
+def test_rotation_dates_include_overdue_accounts_that_still_alert():
+    """An account overdue for rotation and still "active" is exactly the row
+    expiry-evaluator-fn must alert on — StatusIndex is queried with
+    Status = "active"."""
+    from datetime import date
+
+    items = gen.build_accounts(OWNER, 16, _rng())
+    overdue = [
+        i for i in items
+        if date.fromisoformat(i["NextRotationDate"]["S"]) < date.today()
+    ]
+    assert overdue, "no overdue account: the alerting path has nothing to fire on"
+    assert any(i["Status"]["S"] == gen.ACCOUNT_ALERTABLE_STATUS for i in overdue)
 
 
 def test_account_ids_and_usernames_are_unique():
@@ -178,6 +247,23 @@ def test_generation_is_deterministic_so_reruns_upsert_rather_than_duplicate():
 
 
 # --- The CLI itself ----------------------------------------------------------
+
+
+def test_cli_defaults_to_the_shared_owner_when_none_is_given(tmp_path):
+    """Forgetting --owner-id must not produce rows nobody can see."""
+    subprocess.run(
+        [
+            sys.executable, str(ROOT / "scripts" / "gen_demo_data.py"),
+            "--certs", "2", "--accounts", "0", "--audit-events", "0",
+            "--cert-table", "t-certs", "--iam-table", "t-iam", "--audit-table", "t-audit",
+            "--out-dir", str(tmp_path),
+        ],
+        capture_output=True, text=True, check=True,
+    )
+    for path in tmp_path.glob("batch-*.json"):
+        for requests in json.loads(path.read_text()).values():
+            for request in requests:
+                assert request["PutRequest"]["Item"]["OwnerId"]["S"] == gen.SHARED_OWNER_ID
 
 
 def test_cli_writes_valid_batch_files(tmp_path):

@@ -22,6 +22,28 @@ CORS_ALLOW_ORIGIN = os.environ.get("CORS_ALLOW_ORIGIN", "*")
 CORS_ALLOW_METHODS = os.environ.get("CORS_ALLOW_METHODS", "GET, POST, OPTIONS")
 CORS_ALLOW_HEADERS = os.environ.get("CORS_ALLOW_HEADERS", "Content-Type, Authorization")
 
+# The one partition every CRM login can read. OwnerIndex is keyed on OwnerId, so
+# the value of OwnerId is what decides who can see a row — and while discovery
+# and the seeder wrote a *different* OwnerId per Cognito sub, each login saw only
+# the rows seeded for it and the team saw three different dashboards. The project
+# team shares its assets, so the inventory rows live in one shared partition and
+# every authenticated caller reads it.
+#
+# Kept in step with Globals.Function.Environment.Variables.SHARED_OWNER_ID and
+# Ec2DiscoveryFunction's OWNER_ID in template.yaml.
+SHARED_OWNER_ID = os.environ.get("SHARED_OWNER_ID", "crm-resource-owners")
+
+# `Status` is the HASH key of CertInventoryTable's ExpiryIndex, and
+# expiry-evaluator-fn queries it with the literal "ISSUED". Any other value makes
+# a row invisible to expiry alerting — which is how ec2-discovery-fn's
+# "active"/"expiring-soon" rows ended up excluded from every alert while looking
+# fine in the table. One vocabulary, defined here, used by every writer.
+CERT_STATUS_ISSUED = "ISSUED"
+CERT_STATUS_EXPIRED = "EXPIRED"
+# Statuses a cert can carry that are not derived from its expiry date at all.
+CERT_STATUS_REVOKED = "REVOKED"
+CERT_STATUS_PENDING_VALIDATION = "PENDING_VALIDATION"
+
 
 def dynamodb_resource():
     return boto3.resource("dynamodb")
@@ -166,6 +188,77 @@ def is_admin(claims):
 
 def owner_id_of(claims):
     return claims.get("sub", "")
+
+
+def visible_owner_ids(claims):
+    """Every OwnerId partition this caller may read, shared partition first.
+
+    The caller's own sub stays in the list so rows seeded per-login before the
+    move to a shared partition remain readable rather than vanishing from the
+    dashboard the moment this ships.
+    """
+    owner_ids = [SHARED_OWNER_ID]
+    own = owner_id_of(claims)
+    if own and own != SHARED_OWNER_ID:
+        owner_ids.append(own)
+    return owner_ids
+
+
+def can_view(item, claims):
+    """Whether this caller may read/act on one inventory row.
+
+    Admins see everything; everyone else sees the shared team inventory plus
+    anything still owned by their own sub.
+    """
+    if is_admin(claims):
+        return True
+    return (item or {}).get("OwnerId") in visible_owner_ids(claims)
+
+
+def query_owner_partitions(table, index_name, key_name, claims, owner_id_override=None):
+    """Query `index_name` once per visible owner partition and merge the results.
+
+    DynamoDB has no OR across partition keys, so a union of partitions is a
+    query per partition. Results are de-duplicated on `key_name`: the same
+    CertId can legitimately be returned twice while rows are mid-migration from
+    a per-login partition to the shared one, and the UI must not show it twice.
+    """
+    owner_ids = [owner_id_override] if owner_id_override else visible_owner_ids(claims)
+
+    merged = {}
+    for owner_id in owner_ids:
+        paginate_from = None
+        while True:
+            kwargs = {
+                "IndexName": index_name,
+                "KeyConditionExpression": "OwnerId = :owner",
+                "ExpressionAttributeValues": {":owner": owner_id},
+            }
+            if paginate_from:
+                kwargs["ExclusiveStartKey"] = paginate_from
+            response = table.query(**kwargs)
+            for item in response.get("Items", []):
+                merged.setdefault(item[key_name], item)
+            paginate_from = response.get("LastEvaluatedKey")
+            if not paginate_from:
+                break
+    return list(merged.values())
+
+
+def cert_status_for(expiry, now=None):
+    """The Status literal a certificate with this expiry should carry.
+
+    Only ever ISSUED or EXPIRED: a cert's lifecycle status has to agree with its
+    own expiry date, or the dashboard shows rows reading "ISSUED" that expired
+    weeks ago. REVOKED/PENDING_VALIDATION are set explicitly by whoever knows
+    that out-of-band fact, never inferred from a date.
+    """
+    now = now or datetime.now(timezone.utc)
+    if isinstance(expiry, str):
+        expiry = datetime.fromisoformat(expiry)
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    return CERT_STATUS_EXPIRED if expiry < now else CERT_STATUS_ISSUED
 
 
 def new_request_id():

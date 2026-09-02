@@ -131,10 +131,9 @@ FORBIDDEN_STATUS="$(curl -s -o /dev/null -w '%{http_code}' \
 pass "cross-owner /audit as a non-admin -> 403 (owner scoping enforced)"
 
 step "7. Seed a certificate owned by this user, then read it back"
-# Nothing appears in the UI unless OwnerId equals your Cognito sub: the API
-# queries OwnerIndex on the sub, while discovery derives OwnerId from an ACM
-# domain name / IAM cert path / the crm:owner-id tag. This is why a correctly
-# working deployment still shows "No certificates found" on a fresh account.
+# GET /certs reads the shared team partition PLUS the caller's own sub, so a row
+# owned by this login is still returned — that backwards compatibility is what
+# this step checks. The shared partition is checked separately in step 7b.
 EXPIRY="$(python3 -c "
 import datetime
 print((datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=10)).date().isoformat())
@@ -147,7 +146,7 @@ aws dynamodb put-item --table-name "$CERT_TABLE" --region "$REGION" --item "$(ca
   "CertType":   {"S": "ACM"},
   "Domain":     {"S": "validate.example.com"},
   "ExpiryDate": {"S": "$EXPIRY"},
-  "Status":     {"S": "ACTIVE"},
+  "Status":     {"S": "ISSUED"},
   "Source":     {"S": "validate.sh"}
 }
 EOF
@@ -159,6 +158,31 @@ printf '%s' "$SEEDED_JSON" | jq -e --arg id "$SEEDED_CERT_ID" \
   '.items | map(.CertId) | index($id) != null' >/dev/null \
   || fail "seeded cert not returned by GET /certs: $SEEDED_JSON"
 pass "GET /certs returns the seeded cert (owner scoping + GSI query work)"
+
+step "7b. The shared team inventory is visible to this login"
+# The bug this proves fixed: OwnerId is OwnerIndex's HASH key, so querying it with
+# the caller's Cognito sub alone made every row belong to exactly one login —
+# members of one team saw different dashboards, and every row written by discovery
+# (owned by a service identity, never a sub) appeared in nobody's.
+SHARED_OWNER_ID="crm-resource-owners"
+SHARED_COUNT="$(printf '%s' "$SEEDED_JSON" | jq --arg owner "$SHARED_OWNER_ID" \
+  '[.items[] | select(.OwnerId == $owner)] | length')"
+[ "${SHARED_COUNT:-0}" -gt 0 ] \
+  || fail "GET /certs returned no rows owned by $SHARED_OWNER_ID — this login cannot
+       see the shared team inventory, which is the per-login isolation bug.
+       Check that ./deploy.sh seeded it and that SHARED_OWNER_ID agrees across
+       crm_common, template.yaml and gen_demo_data.py."
+pass "GET /certs returns $SHARED_COUNT row(s) from the shared partition (every login sees them)"
+
+# Every status must agree with its own expiry date. A row reading ISSUED that
+# expired months ago is the "the data makes no sense" report.
+INCONSISTENT="$(printf '%s' "$SEEDED_JSON" | jq -r --arg today "$(date -u +%F)" \
+  '[.items[] | select((.ExpiryDate[0:10] < $today and .Status == "ISSUED")
+                   or (.ExpiryDate[0:10] > $today and .Status == "EXPIRED"))
+    | .CertId] | join(", ")')"
+[ -z "$INCONSISTENT" ] \
+  || fail "these rows carry a Status that contradicts their ExpiryDate: $INCONSISTENT"
+pass "every row's Status agrees with its ExpiryDate"
 
 DETAIL_STATUS="$(curl -s -o /dev/null -w '%{http_code}' \
   "$API_URL/certs/$SEEDED_CERT_ID" -H "Authorization: $ID_TOKEN")"

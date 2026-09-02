@@ -1,52 +1,102 @@
-"""ec2-discovery-fn: discovers OS-level certificates from the cert-scanner EC2
-instance (see Ec2CertScannerInstance in template.yaml) and merges them into the
-cert inventory table.
+"""ec2-discovery-fn: discovers certificates from the cert-scanner EC2 instance
+(see Ec2CertScannerInstance in template.yaml) and merges them into the cert
+inventory table.
 
-Triggered every 30 minutes by Ec2DiscoveryScheduleRule. One SSM Run Command
-does both the enumeration and the parsing: it lists every *.pem under
-/etc/ssl/certs and, for each, runs `openssl x509 -text` wrapped in file
-markers, so a single SendCommand/GetCommandInvocation round trip yields every
-certificate's full text in one stdout blob — avoiding one SSM round trip per
-certificate, which would not fit this function's Lambda timeout.
+Two directories are scanned, and the distinction matters:
 
-Discovered rows are merged (never replaced): an existing CertId's ExpiryDate/
-Status/LastDiscoveredAt are updated in place, a new CertId is inserted, and
-nothing already in the table is ever deleted here.
+  * APP_CERT_DIR (/opt/app/certs) — the instance's own application certificates.
+    Its UserData builds an internal CA at first boot, generates a private key and
+    a CSR per service hostname, signs each CSR with that CA, and installs the
+    signed leaf here. Those are the rows worth looking at on the dashboard:
+    real X.509 certificates, with deliberately varied validity so the expiry
+    bands and the alerting path both have something to act on.
+  * SYSTEM_CERT_DIR (/etc/ssl/certs) — the OS trust store. Useful (a root CA
+    does expire) but voluminous, so it is capped at SYSTEM_CERT_LIMIT.
+
+Triggered every 30 minutes by Ec2DiscoveryScheduleRule. One SSM Run Command does
+both the enumeration and the parsing: it lists the certificate files and, for
+each, runs `openssl x509 -text` wrapped in file markers, so a single
+SendCommand/GetCommandInvocation round trip yields every certificate's full text
+in one stdout blob — avoiding one SSM round trip per certificate, which would not
+fit this function's Lambda timeout.
+
+Discovered rows are merged, never wholesale replaced: an existing CertId's
+ExpiryDate/Status/LastDiscoveredAt are updated in place and a new CertId is
+inserted. The one thing this function does delete is a row it wrote itself for an
+EC2 instance that no longer exists — CertId hashes in the instance id, so a
+replaced instance (any UserData change replaces it) would otherwise leave a
+full set of orphans behind on every deploy.
 """
 import hashlib
 import os
 import re
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import boto3
 import botocore.exceptions
 
-from crm_common import structured_log
+from crm_common import SHARED_OWNER_ID, cert_status_for, structured_log
 
 INSTANCE_ID_PARAM_NAME = os.environ["EC2_INSTANCE_ID_PARAM"]
 CERT_TABLE_NAME = os.environ["CERT_TABLE"]
-OWNER_ID = os.environ["OWNER_ID"]
+# The shared team partition — every CRM login reads it. A per-login OwnerId here
+# is what made these rows invisible to everybody: GET /certs queries OwnerIndex,
+# and this function has no Cognito sub to write.
+OWNER_ID = os.environ.get("OWNER_ID") or SHARED_OWNER_ID
+
+APP_CERT_DIR = os.environ.get("APP_CERT_DIR", "/opt/app/certs")
+SYSTEM_CERT_DIR = os.environ.get("SYSTEM_CERT_DIR", "/etc/ssl/certs")
+# The Ubuntu trust store holds ~140 roots. Storing all of them buries the
+# application certificates the dashboard exists to show, so cap it.
+SYSTEM_CERT_LIMIT = int(os.environ.get("SYSTEM_CERT_LIMIT", "50"))
 
 SOURCE_NAME = "ec2-os-certs"
-EXPIRING_SOON_WINDOW_DAYS = 30
+CERT_TYPE_APP = "EC2_APP_CERT"
+CERT_TYPE_SYSTEM_CA = "EC2_SYSTEM_CA"
 COMMAND_POLL_INTERVAL_SECONDS = 2
 COMMAND_POLL_BUDGET_SECONDS = 20
 DYNAMODB_MAX_RETRIES = 3
 DYNAMODB_RETRY_BASE_DELAY_SECONDS = 0.5
 
-# Best-effort enumeration of the OS certificate store, each cert's full text
-# wrapped in markers so multiple certs' openssl output can be told apart in one
-# stdout blob. Ubuntu populates /etc/ssl/certs with per-certificate .pem
-# symlinks, so this needs no knowledge of which CAs are installed.
-CERT_SCAN_COMMAND = (
-    'for f in $(find /etc/ssl/certs -name "*.pem" -type f | head -100); do '
-    'echo "===CERT_FILE_START:$f==="; '
-    'openssl x509 -in "$f" -text -noout -nameopt RFC2253 2>/dev/null '
-    '|| echo "===CERT_PARSE_ERROR:$f==="; '
-    'echo "===CERT_FILE_END:$f==="; '
-    "done"
-)
+
+def build_scan_command(app_dir=None, system_dir=None, system_limit=None):
+    """The shell the SSM Run Command executes on the instance.
+
+    Each certificate's full `openssl x509 -text` output is wrapped in markers
+    naming its path, so one stdout blob can be split back into per-file blocks
+    and each block classified by the directory it came from.
+
+    The application directory is enumerated first and in full — it is small, and
+    those are the rows that matter. The trust store follows, capped, so a
+    hundred-odd root CAs cannot crowd out the application certificates or
+    overrun the command's output limit.
+    """
+    app_dir = app_dir or APP_CERT_DIR
+    system_dir = system_dir or SYSTEM_CERT_DIR
+    system_limit = SYSTEM_CERT_LIMIT if system_limit is None else system_limit
+
+    # -L follows the per-certificate symlinks Ubuntu populates /etc/ssl/certs
+    # with; without it `-type f` matches almost nothing there.
+    listings = [f'find -L {app_dir} -name "*.pem" -o -name "*.crt" 2>/dev/null']
+    if system_limit > 0:
+        listings.append(
+            f'find -L {system_dir} -name "*.pem" -type f 2>/dev/null | head -{system_limit}'
+        )
+
+    return (
+        "for f in $(" + "; ".join(listings) + "); do "
+        '[ -f "$f" ] || continue; '
+        'echo "===CERT_FILE_START:$f==="; '
+        'openssl x509 -in "$f" -text -noout -nameopt RFC2253 2>/dev/null '
+        '|| echo "===CERT_PARSE_ERROR:$f==="; '
+        'echo "===CERT_FILE_END:$f==="; '
+        "done"
+    )
+
+
+# Kept for callers/tests that want the default command without arguments.
+CERT_SCAN_COMMAND = build_scan_command()
 
 _FILE_START_RE = re.compile(r"===CERT_FILE_START:(.*?)===\n")
 _SERIAL_BLOCK_RE = re.compile(r"Serial Number:\s*\n\s*([0-9a-fA-F]{1,2}(?::[0-9a-fA-F]{2})+)")
@@ -137,21 +187,40 @@ def _compute_cert_id(serial, instance_id):
 
 
 def _compute_status(expiry_dt, now):
-    if expiry_dt < now:
-        return "expired"
-    if expiry_dt < now + timedelta(days=EXPIRING_SOON_WINDOW_DAYS):
-        return "expiring-soon"
-    return "active"
+    """ISSUED or EXPIRED — the same vocabulary every other writer uses.
+
+    This function used to emit "active"/"expiring-soon"/"expired". `Status` is
+    ExpiryIndex's HASH key and expiry-evaluator-fn queries it with the literal
+    "ISSUED", so those rows were silently excluded from every expiry alert while
+    looking perfectly healthy in the table, and sat in the UI next to seeded rows
+    reading "ISSUED" as if they were a different kind of thing. "Expiring soon"
+    is not a status, it is a distance from today — the dashboard computes it from
+    ExpiryDate and colours the row accordingly.
+    """
+    return cert_status_for(expiry_dt, now)
 
 
-def _classify_cert_type(issuer_dn):
+def _classify_cert_type(issuer_dn, path=None):
+    """EC2_APP_CERT for the instance's own application certificates,
+    EC2_SYSTEM_CA for the OS trust store.
+
+    The directory is authoritative when known: an application certificate signed
+    by an internal CA whose name happens to contain a public CA's brand would
+    otherwise be filed as a system root. The issuer heuristic remains the
+    fallback for a certificate found outside either known directory.
+    """
+    if path:
+        if path.startswith(APP_CERT_DIR):
+            return CERT_TYPE_APP
+        if path.startswith(SYSTEM_CERT_DIR):
+            return CERT_TYPE_SYSTEM_CA
     if not issuer_dn:
-        return "app-cert"
+        return CERT_TYPE_APP
     lowered = issuer_dn.lower()
-    return "system-ca" if any(marker in lowered for marker in _KNOWN_ROOT_CA_MARKERS) else "app-cert"
+    return CERT_TYPE_SYSTEM_CA if any(m in lowered for m in _KNOWN_ROOT_CA_MARKERS) else CERT_TYPE_APP
 
 
-def _build_cert_item(block, instance_id, now):
+def _build_cert_item(block, instance_id, now, path=None):
     """Turn one openssl x509 -text block into a cert-inventory item, or None
     if it lacks the minimum fields (serial, expiry) needed to be useful."""
     serial = _parse_serial(block)
@@ -180,7 +249,12 @@ def _build_cert_item(block, instance_id, now):
         "ExpiryDate": expiry_dt.isoformat(),
         "Status": _compute_status(expiry_dt, now),
         "Source": SOURCE_NAME,
-        "CertType": _classify_cert_type(issuer_dn),
+        "CertType": _classify_cert_type(issuer_dn, path),
+        # Which instance this came from, so a row left behind by a replaced
+        # instance can be recognised and pruned — see _prune_stale_instances.
+        "InstanceId": instance_id,
+        "CertPath": path,
+        "EnvironmentTag": "aws",
         "LastDiscoveredAt": now.isoformat(),
     }
     return {k: v for k, v in item.items() if v is not None}
@@ -228,7 +302,7 @@ def _dispatch_and_collect(ssm, instance_id, request_id):
                 InstanceIds=[instance_id],
                 DocumentName="AWS-RunShellScript",
                 Comment="app-d9fae51c-1929cc69 OS certificate discovery",
-                Parameters={"commands": [CERT_SCAN_COMMAND]},
+                Parameters={"commands": [build_scan_command()]},
             )
         except botocore.exceptions.ClientError as exc:
             structured_log(
@@ -289,6 +363,39 @@ def _with_retry(request_id, event_type, cert_id, fn):
             delay *= 2
 
 
+def _prune_stale_instances(table, existing, instance_id, request_id):
+    """Delete rows this function wrote for an EC2 instance that no longer exists.
+
+    CertId is a hash of (serial, instance id), so the same certificate on a
+    replaced instance is a different row. Any UserData or AMI change replaces the
+    instance, which without this leaves a complete set of orphaned certificates
+    behind on every deploy — rows that look real, never update again, and drift
+    into "expired" while nothing on the dashboard explains why.
+
+    Scoped tightly: only rows whose Source is this function's own, and only those
+    carrying a different InstanceId. A row with no InstanceId at all predates that
+    attribute and is left alone rather than guessed about.
+    """
+    stale = [
+        cert_id for cert_id, item in existing.items()
+        if item.get("InstanceId") and item["InstanceId"] != instance_id
+    ]
+    pruned = 0
+    for cert_id in stale:
+        try:
+            table.delete_item(Key={"CertId": cert_id})
+        except Exception as exc:
+            structured_log(
+                request_id, "EC2_DISCOVERY_PRUNE_FAILED", level="WARNING",
+                certId=cert_id, error=str(exc),
+            )
+            continue
+        existing.pop(cert_id, None)
+        pruned += 1
+        structured_log(request_id, "EC2_DISCOVERY_PRUNED_STALE_INSTANCE_ROW", certId=cert_id)
+    return pruned
+
+
 def _publish_error_metric(request_id):
     try:
         boto3.client("cloudwatch").put_metric_data(
@@ -321,7 +428,7 @@ def handler(event, context):
         item = None
         if block is not None:
             try:
-                item = _build_cert_item(block, instance_id, now)
+                item = _build_cert_item(block, instance_id, now, path=path)
             except Exception as exc:
                 structured_log(request_id, "EC2_DISCOVERY_CERT_PARSE_FAILED", level="WARNING", path=path, error=str(exc))
         if item is None:
@@ -330,12 +437,31 @@ def handler(event, context):
             continue
         items.append(item)
 
+    app_cert_count = sum(1 for i in items if i["CertType"] == CERT_TYPE_APP)
+    structured_log(
+        request_id, "EC2_DISCOVERY_PARSED",
+        totalCertsFound=len(items), appCerts=app_cert_count,
+        systemCas=len(items) - app_cert_count,
+    )
+    if not app_cert_count:
+        # The instance's UserData generates and signs these at first boot, so an
+        # empty application directory means either the boot script has not
+        # finished yet (this runs minutes after deploy) or it failed. Worth saying
+        # out loud: the trust store alone still yields rows, which otherwise makes
+        # a broken certificate-issuing step look like a successful scan.
+        structured_log(
+            request_id, "EC2_DISCOVERY_NO_APP_CERTS", level="WARNING",
+            appCertDir=APP_CERT_DIR, instanceId=instance_id,
+        )
+
     table = boto3.resource("dynamodb").Table(CERT_TABLE_NAME)
     try:
         existing = _existing_certs_by_id(table, OWNER_ID)
     except Exception as exc:
         structured_log(request_id, "EC2_DISCOVERY_QUERY_FAILED", level="ERROR", error=str(exc))
         existing = {}
+
+    pruned_count = _prune_stale_instances(table, existing, instance_id, request_id)
 
     new_count = updated_count = unchanged_count = 0
     try:
@@ -351,14 +477,26 @@ def handler(event, context):
                 changed = prior.get("ExpiryDate") != item["ExpiryDate"] or prior.get("Status") != item["Status"]
 
                 def _update(item=item, cert_id=cert_id):
+                    # CertType/InstanceId are set here too, not just on insert:
+                    # rows written before those attributes existed (or under the
+                    # old "active"/"expiring-soon" status vocabulary) are
+                    # corrected in place on the next cycle rather than staying
+                    # wrong until someone deletes them.
                     table.update_item(
                         Key={"CertId": cert_id},
-                        UpdateExpression="SET ExpiryDate = :expiry, #status = :status, LastDiscoveredAt = :discovered",
+                        UpdateExpression=(
+                            "SET ExpiryDate = :expiry, #status = :status, "
+                            "LastDiscoveredAt = :discovered, CertType = :certType, "
+                            "InstanceId = :instanceId, OwnerId = :ownerId"
+                        ),
                         ExpressionAttributeNames={"#status": "Status"},
                         ExpressionAttributeValues={
                             ":expiry": item["ExpiryDate"],
                             ":status": item["Status"],
                             ":discovered": item["LastDiscoveredAt"],
+                            ":certType": item["CertType"],
+                            ":instanceId": item["InstanceId"],
+                            ":ownerId": item["OwnerId"],
                         },
                     )
 
@@ -386,14 +524,16 @@ def handler(event, context):
     duration_ms = int((time.monotonic() - start) * 1000)
     structured_log(
         request_id, "EC2_DISCOVERY_CYCLE_COMPLETE",
-        totalCertsFound=len(items), newCerts=new_count,
+        totalCertsFound=len(items), appCerts=app_cert_count, newCerts=new_count,
         updatedCerts=updated_count, unchangedCerts=unchanged_count,
-        durationMs=duration_ms,
+        prunedCerts=pruned_count, durationMs=duration_ms,
     )
     return {
         "instanceId": instance_id,
         "totalCertsFound": len(items),
+        "appCerts": app_cert_count,
         "newCerts": new_count,
         "updatedCerts": updated_count,
         "unchangedCerts": unchanged_count,
+        "prunedCerts": pruned_count,
     }

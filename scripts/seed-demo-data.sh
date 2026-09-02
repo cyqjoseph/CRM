@@ -5,15 +5,18 @@
 #   ./scripts/seed-demo-data.sh                          # defaults (40/15/30)
 #   ./scripts/seed-demo-data.sh --certs 200 --accounts 50
 #   ./scripts/seed-demo-data.sh --clean                  # remove them again
+#   ./scripts/seed-demo-data.sh --retire-legacy-fixed-rows  # drop the pre-generator rows
 #
-# OWNERSHIP IS THE WHOLE TRICK. GET /certs and GET /iam/accounts query
-# OwnerIndex with the caller's Cognito `sub`, so a row is visible to exactly one
-# login. Set SEED_OWNER_ID to your own sub:
+# OWNERSHIP. OwnerId is OwnerIndex's HASH key, so its value decides which logins
+# can see a row. These rows go to the SHARED TEAM PARTITION (crm-resource-owners),
+# which GET /certs and GET /iam/accounts read for every authenticated caller — so
+# the whole project team sees one inventory.
 #
-#   SEED_OWNER_ID=<your-sub> ./scripts/seed-demo-data.sh
+# Seeding a single Cognito `sub` instead, as this script used to, gives that one
+# login a private dashboard and shows every other member nothing. Only do it to
+# reproduce that:
 #
-# Find it by signing in once and reading any api-certs-fn log line's `ownerId`
-# field, or from the Cognito console. It is also in the JWT — the `sub` claim.
+#   SEED_OWNER_ID=<a-cognito-sub> ./scripts/seed-demo-data.sh
 #
 # Every id starts with `demo-`, and --clean deletes only those ids, so this can
 # never remove a genuinely discovered certificate or account.
@@ -26,13 +29,15 @@ CERT_TABLE="app-d9fae51c-1929cc69-cert-inventory"
 IAM_TABLE="app-d9fae51c-1929cc69-iam-accounts"
 AUDIT_TABLE="app-d9fae51c-1929cc69-audit-hot"
 
-# Same default as deploy.sh, so a plain run seeds the same login either way.
-SEED_OWNER_ID="${SEED_OWNER_ID:-d9ca551c-d0a1-7011-1c4f-99a48c8d917f}"
+# The shared team partition. Kept in step with crm_common.SHARED_OWNER_ID,
+# gen_demo_data.SHARED_OWNER_ID and template.yaml's SHARED_OWNER_ID env var.
+SEED_OWNER_ID="${SEED_OWNER_ID:-crm-resource-owners}"
 
 CERTS=40
 ACCOUNTS=15
 AUDIT_EVENTS=30
 CLEAN=false
+RETIRE_LEGACY=false
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -41,6 +46,7 @@ while [ $# -gt 0 ]; do
     --audit-events) AUDIT_EVENTS="$2"; shift 2 ;;
     --owner-id)     SEED_OWNER_ID="$2"; shift 2 ;;
     --clean)        CLEAN=true; shift ;;
+    --retire-legacy-fixed-rows) RETIRE_LEGACY=true; shift ;;
     -h|--help)      sed -n '2,20p' "$0"; exit 0 ;;
     *)              echo "unknown argument: $1" >&2; exit 1 ;;
   esac
@@ -60,8 +66,12 @@ GEN_ARGS=(
   --out-dir "$OUT_DIR"
 )
 [ "$CLEAN" = true ] && GEN_ARGS+=(--delete)
+[ "$RETIRE_LEGACY" = true ] && GEN_ARGS+=(--retire-legacy-fixed)
 
-if [ "$CLEAN" = true ]; then
+if [ "$RETIRE_LEGACY" = true ]; then
+  printf '\n\033[1mRetiring the fixed rows an earlier deploy.sh left behind\033[0m\n'
+  info "cert-001..003, hash-acct-001..002 — named ids only, never a prefix match"
+elif [ "$CLEAN" = true ]; then
   printf '\n\033[1mRemoving demo rows owned by %s\033[0m\n' "$SEED_OWNER_ID"
 else
   printf '\n\033[1mSeeding %s certificates, %s accounts, %s audit events\033[0m\n' \
@@ -109,6 +119,11 @@ done <<<"$BATCHES"
 
 pass "applied $COUNT batch(es)"
 
+if [ "$RETIRE_LEGACY" = true ]; then
+  printf '\n\033[32mLegacy fixed rows retired.\033[0m\n'
+  exit 0
+fi
+
 if [ "$CLEAN" = true ]; then
   printf '\n\033[32mDemo rows removed.\033[0m\n'
   exit 0
@@ -116,12 +131,14 @@ fi
 
 cat <<EOF
 
-$(printf '\033[32mDone.\033[0m') Sign in as the owner of $SEED_OWNER_ID and check:
+$(printf '\033[32mDone.\033[0m') Sign in as ANY CRM user and check:
 
-  Certificates   $CERTS rows spanning all three colour bands (red <=7d,
-                 amber <=30d, green beyond). ~1 in 6 carries a non-ISSUED
-                 status, so it is excluded from expiry alerting on purpose.
-  IAM Accounts   $ACCOUNTS rows. ~1 in 4 is warning/critical rather than active.
+  Certificates   $CERTS rows spanning every band — already expired, red <=7d,
+                 amber <=30d, green beyond. Each row's status agrees with its
+                 date; a minority are REVOKED/PENDING_VALIDATION, so they are
+                 excluded from expiry alerting on purpose.
+  IAM Accounts   $ACCOUNTS rows, including some overdue for rotation.
+                 ~1 in 4 is warning/critical rather than active.
   Audit          search for  $SEED_OWNER_ID  to see $AUDIT_EVENTS events.
 
 Remove them again with:

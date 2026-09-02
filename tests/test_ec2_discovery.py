@@ -158,12 +158,13 @@ def test_new_certs_are_discovered_and_written_to_dynamodb(mock_client, mock_reso
     assert table.put_item.call_count == 2
 
     written = {c.kwargs["Item"]["Domain"]: c.kwargs["Item"] for c in table.put_item.call_args_list}
-    assert written["example.com"]["CertType"] == "system-ca"
-    assert written["example.com"]["Status"] == "active"
+    assert written["example.com"]["CertType"] == app.CERT_TYPE_SYSTEM_CA
+    assert written["example.com"]["Status"] == "ISSUED"
     assert written["example.com"]["Source"] == "ec2-os-certs"
     assert written["example.com"]["OwnerId"] == "crm-resource-owners"
-    assert written["internal.acme.local"]["CertType"] == "app-cert"
-    assert written["internal.acme.local"]["Status"] == "expired"
+    assert written["example.com"]["InstanceId"] == INSTANCE_ID
+    assert written["internal.acme.local"]["CertType"] == app.CERT_TYPE_SYSTEM_CA
+    assert written["internal.acme.local"]["Status"] == "EXPIRED"
 
 
 @patch("boto3.resource")
@@ -204,7 +205,7 @@ def test_existing_cert_is_updated_in_place_and_other_fields_are_left_alone(mock_
             "Domain": "example.com",
             "Source": "ec2-os-certs",
             "ExpiryDate": "2019-01-01T00:00:00+00:00",
-            "Status": "expired",
+            "Status": "EXPIRED",
         }]
     }
     mock_resource.return_value.Table.return_value = table
@@ -217,7 +218,7 @@ def test_existing_cert_is_updated_in_place_and_other_fields_are_left_alone(mock_
     table.update_item.assert_called_once()
     kwargs = table.update_item.call_args.kwargs
     assert kwargs["Key"] == {"CertId": cert_id}
-    assert kwargs["ExpressionAttributeValues"][":status"] == "active"
+    assert kwargs["ExpressionAttributeValues"][":status"] == "ISSUED"
     assert "ExpiryDate = :expiry" in kwargs["UpdateExpression"]
 
 
@@ -239,7 +240,7 @@ def test_cert_with_no_changes_is_still_updated_but_counted_as_unchanged(mock_cli
             "OwnerId": "crm-resource-owners",
             "Source": "ec2-os-certs",
             "ExpiryDate": expiry_dt.isoformat(),
-            "Status": "active",
+            "Status": "ISSUED",
         }]
     }
     mock_resource.return_value.Table.return_value = table
@@ -263,7 +264,7 @@ def test_query_ignores_rows_from_a_different_source(mock_client, mock_resource):
     cert_id = app._compute_cert_id("0a1b2c3d4e5f6071", INSTANCE_ID)
     table = MagicMock()
     table.query.return_value = {
-        "Items": [{"CertId": cert_id, "OwnerId": "crm-resource-owners", "Source": "demo-seed", "Status": "active"}]
+        "Items": [{"CertId": cert_id, "OwnerId": "crm-resource-owners", "Source": "demo-seed", "Status": "ISSUED"}]
     }
     mock_resource.return_value.Table.return_value = table
 
@@ -392,17 +393,29 @@ def test_extract_cn_returns_none_for_a_dn_with_no_cn():
     assert app._extract_cn("O=Example Inc,C=US") is None
 
 
-def test_compute_status_boundaries():
+def test_compute_status_uses_the_same_vocabulary_as_expiry_alerting():
+    """`Status` is ExpiryIndex's HASH key and expiry-evaluator-fn queries it with
+    the literal "ISSUED". This function used to write "active"/"expiring-soon",
+    so every certificate it discovered was silently excluded from alerting."""
     now = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    assert app._compute_status(now - timedelta(days=1), now) == "expired"
-    assert app._compute_status(now + timedelta(days=10), now) == "expiring-soon"
-    assert app._compute_status(now + timedelta(days=60), now) == "active"
+    assert app._compute_status(now - timedelta(days=1), now) == "EXPIRED"
+    assert app._compute_status(now + timedelta(days=10), now) == "ISSUED"
+    assert app._compute_status(now + timedelta(days=60), now) == "ISSUED"
 
 
-def test_classify_cert_type_recognises_known_root_cas():
-    assert app._classify_cert_type("CN=DigiCert Global Root CA,O=DigiCert Inc,C=US") == "system-ca"
-    assert app._classify_cert_type("CN=Internal App CA,O=Acme Corp,C=US") == "app-cert"
-    assert app._classify_cert_type(None) == "app-cert"
+def test_classify_cert_type_uses_the_directory_when_it_knows_it():
+    """An internal CA whose name contains a public brand must not file an
+    application certificate as a system root."""
+    app_path = f"{app.APP_CERT_DIR}/payments.pem"
+    assert app._classify_cert_type("CN=Amazon Internal CA", app_path) == app.CERT_TYPE_APP
+    system_path = f"{app.SYSTEM_CERT_DIR}/DigiCert.pem"
+    assert app._classify_cert_type("CN=Internal App CA,O=Acme Corp,C=US", system_path) == app.CERT_TYPE_SYSTEM_CA
+
+
+def test_classify_cert_type_falls_back_to_the_issuer_when_the_path_is_unknown():
+    assert app._classify_cert_type("CN=DigiCert Global Root CA,O=DigiCert Inc,C=US") == app.CERT_TYPE_SYSTEM_CA
+    assert app._classify_cert_type("CN=Internal App CA,O=Acme Corp,C=US") == app.CERT_TYPE_APP
+    assert app._classify_cert_type(None) == app.CERT_TYPE_APP
 
 
 def test_compute_cert_id_is_stable_for_the_same_inputs():
@@ -422,3 +435,262 @@ def test_build_cert_item_prefers_subject_cn_then_san_then_issuer_cn():
     block2 = no_subject_cn.split("===\n", 1)[1].split("===CERT_FILE_END", 1)[0]
     item2 = app._build_cert_item(block2, INSTANCE_ID, now)
     assert item2["Domain"] == "san.example.com"
+
+
+# ---------------------------------------------------------------------------
+# Application certificates vs the OS trust store
+# ---------------------------------------------------------------------------
+#
+# The instance's UserData builds an internal CA at first boot, generates a key
+# and a CSR per hostname, signs each with that CA, and installs the leaf into
+# APP_CERT_DIR. Those are the rows the dashboard exists to show; /etc/ssl/certs
+# is the ~140-entry OS trust store and must not crowd them out.
+
+
+def test_the_scan_command_enumerates_the_application_directory_first():
+    command = app.build_scan_command()
+    assert app.APP_CERT_DIR in command
+    assert app.SYSTEM_CERT_DIR in command
+    assert command.index(app.APP_CERT_DIR) < command.index(app.SYSTEM_CERT_DIR), (
+        "the application certificates must be listed before the capped trust store, "
+        "or the cap can consume the whole listing"
+    )
+
+
+def test_the_scan_command_caps_the_trust_store_but_never_the_application_certs():
+    command = app.build_scan_command(system_limit=7)
+    assert "head -7" in command
+    app_clause = command[command.index(app.APP_CERT_DIR):command.index(app.SYSTEM_CERT_DIR)]
+    assert "head" not in app_clause
+
+
+def test_the_scan_command_can_skip_the_trust_store_entirely():
+    command = app.build_scan_command(system_limit=0)
+    assert app.APP_CERT_DIR in command
+    assert app.SYSTEM_CERT_DIR not in command
+
+
+def test_the_scan_command_follows_symlinks():
+    """Ubuntu populates /etc/ssl/certs with per-certificate symlinks; a bare
+    `find -type f` there matches almost nothing."""
+    assert "find -L" in app.build_scan_command()
+
+
+@patch("boto3.resource")
+@patch("boto3.client")
+def test_an_application_certificate_is_filed_and_reported_as_one(mock_client, mock_resource):
+    ssm, _ = _clients(mock_client)
+    ssm.get_parameter.return_value = {"Parameter": {"Value": INSTANCE_ID}}
+    ssm.send_command.return_value = {"Command": {"CommandId": "cmd-1"}}
+    stdout = _cert_block(
+        path=f"{app.APP_CERT_DIR}/payments.pem",
+        issuer="CN=app-d9fae51c-1929cc69 Internal CA,O=CRM,C=SG",
+        subject="CN=payments.internal.example.com,O=CRM,C=SG",
+        not_after="Jan  1 00:00:00 2030 GMT",
+    ) + _cert_block(
+        path=f"{app.SYSTEM_CERT_DIR}/DigiCert_Global_Root_CA.pem",
+        serial="11:22:33:44:55:66:77:88",
+        issuer="CN=DigiCert Global Root CA,O=DigiCert Inc,C=US",
+        subject="CN=DigiCert Global Root CA,O=DigiCert Inc,C=US",
+        not_after="Jan  1 00:00:00 2031 GMT",
+    )
+    ssm.get_command_invocation.return_value = _success_invocation(stdout)
+
+    table = MagicMock()
+    table.query.return_value = {"Items": []}
+    mock_resource.return_value.Table.return_value = table
+
+    result = app.handler({}, None)
+
+    assert result["totalCertsFound"] == 2
+    assert result["appCerts"] == 1, "the app/system split is what tells us the CA step ran"
+
+    written = {c.kwargs["Item"]["Domain"]: c.kwargs["Item"] for c in table.put_item.call_args_list}
+    leaf = written["payments.internal.example.com"]
+    assert leaf["CertType"] == app.CERT_TYPE_APP
+    assert leaf["CertPath"] == f"{app.APP_CERT_DIR}/payments.pem"
+    assert leaf["Issuer"].startswith("CN=app-d9fae51c-1929cc69 Internal CA")
+    assert written["DigiCert Global Root CA"]["CertType"] == app.CERT_TYPE_SYSTEM_CA
+
+
+@patch("boto3.resource")
+@patch("boto3.client")
+def test_an_empty_application_directory_is_reported_not_silently_passed(mock_client, mock_resource):
+    """The trust store alone still yields rows, so a failed certificate-issuing
+    step looks exactly like a successful scan unless it is called out."""
+    ssm, _ = _clients(mock_client)
+    ssm.get_parameter.return_value = {"Parameter": {"Value": INSTANCE_ID}}
+    ssm.send_command.return_value = {"Command": {"CommandId": "cmd-1"}}
+    ssm.get_command_invocation.return_value = _success_invocation(
+        _cert_block(path=f"{app.SYSTEM_CERT_DIR}/x.pem")
+    )
+
+    table = MagicMock()
+    table.query.return_value = {"Items": []}
+    mock_resource.return_value.Table.return_value = table
+
+    with patch.object(app, "structured_log") as log:
+        result = app.handler({}, None)
+
+    assert result["appCerts"] == 0
+    assert any(c.args[1] == "EC2_DISCOVERY_NO_APP_CERTS" for c in log.call_args_list)
+
+
+# ---------------------------------------------------------------------------
+# Pruning rows left behind by a replaced instance
+# ---------------------------------------------------------------------------
+
+
+@patch("boto3.resource")
+@patch("boto3.client")
+def test_rows_from_a_replaced_instance_are_deleted(mock_client, mock_resource):
+    """CertId hashes in the instance id, and any UserData change replaces the
+    instance — so without this every deploy leaves a full set of orphans that
+    never update again and drift into EXPIRED."""
+    ssm, _ = _clients(mock_client)
+    ssm.get_parameter.return_value = {"Parameter": {"Value": INSTANCE_ID}}
+    ssm.send_command.return_value = {"Command": {"CommandId": "cmd-1"}}
+    ssm.get_command_invocation.return_value = _success_invocation(_cert_block())
+
+    table = MagicMock()
+    table.query.return_value = {
+        "Items": [{
+            "CertId": "ec2-orphan",
+            "OwnerId": "crm-resource-owners",
+            "Source": app.SOURCE_NAME,
+            "InstanceId": "i-000000000deadbeef",
+            "Status": "ISSUED",
+        }]
+    }
+    mock_resource.return_value.Table.return_value = table
+
+    result = app.handler({}, None)
+
+    assert result["prunedCerts"] == 1
+    table.delete_item.assert_called_once_with(Key={"CertId": "ec2-orphan"})
+
+
+@patch("boto3.resource")
+@patch("boto3.client")
+def test_rows_from_the_current_instance_are_never_pruned(mock_client, mock_resource):
+    ssm, _ = _clients(mock_client)
+    ssm.get_parameter.return_value = {"Parameter": {"Value": INSTANCE_ID}}
+    ssm.send_command.return_value = {"Command": {"CommandId": "cmd-1"}}
+    ssm.get_command_invocation.return_value = _success_invocation(_cert_block())
+
+    cert_id = app._compute_cert_id("0a1b2c3d4e5f6071", INSTANCE_ID)
+    table = MagicMock()
+    table.query.return_value = {
+        "Items": [{
+            "CertId": cert_id,
+            "OwnerId": "crm-resource-owners",
+            "Source": app.SOURCE_NAME,
+            "InstanceId": INSTANCE_ID,
+            "ExpiryDate": "2030-01-01T00:00:00+00:00",
+            "Status": "ISSUED",
+        }]
+    }
+    mock_resource.return_value.Table.return_value = table
+
+    result = app.handler({}, None)
+
+    assert result["prunedCerts"] == 0
+    table.delete_item.assert_not_called()
+
+
+@patch("boto3.resource")
+@patch("boto3.client")
+def test_a_row_with_no_instance_id_is_left_alone_rather_than_guessed_about(mock_client, mock_resource):
+    ssm, _ = _clients(mock_client)
+    ssm.get_parameter.return_value = {"Parameter": {"Value": INSTANCE_ID}}
+    ssm.send_command.return_value = {"Command": {"CommandId": "cmd-1"}}
+    ssm.get_command_invocation.return_value = _success_invocation(_cert_block())
+
+    table = MagicMock()
+    table.query.return_value = {
+        "Items": [{"CertId": "ec2-legacy", "OwnerId": "crm-resource-owners",
+                   "Source": app.SOURCE_NAME, "Status": "ISSUED"}]
+    }
+    mock_resource.return_value.Table.return_value = table
+
+    result = app.handler({}, None)
+
+    assert result["prunedCerts"] == 0
+    table.delete_item.assert_not_called()
+
+
+@patch("boto3.resource")
+@patch("boto3.client")
+def test_pruning_never_touches_a_row_from_another_source(mock_client, mock_resource):
+    """_existing_certs_by_id filters on Source, so a demo-seed or IAM-discovered
+    row can never reach the pruner — this pins that down."""
+    ssm, _ = _clients(mock_client)
+    ssm.get_parameter.return_value = {"Parameter": {"Value": INSTANCE_ID}}
+    ssm.send_command.return_value = {"Command": {"CommandId": "cmd-1"}}
+    ssm.get_command_invocation.return_value = _success_invocation(_cert_block())
+
+    table = MagicMock()
+    table.query.return_value = {
+        "Items": [{"CertId": "demo-cert-0001", "OwnerId": "crm-resource-owners",
+                   "Source": "demo-seed", "InstanceId": "i-000000000deadbeef"}]
+    }
+    mock_resource.return_value.Table.return_value = table
+
+    result = app.handler({}, None)
+
+    assert result["prunedCerts"] == 0
+    table.delete_item.assert_not_called()
+
+
+@patch("boto3.resource")
+@patch("boto3.client")
+def test_a_failed_prune_is_logged_and_does_not_abort_the_cycle(mock_client, mock_resource):
+    ssm, _ = _clients(mock_client)
+    ssm.get_parameter.return_value = {"Parameter": {"Value": INSTANCE_ID}}
+    ssm.send_command.return_value = {"Command": {"CommandId": "cmd-1"}}
+    ssm.get_command_invocation.return_value = _success_invocation(_cert_block())
+
+    table = MagicMock()
+    table.query.return_value = {
+        "Items": [{"CertId": "ec2-orphan", "OwnerId": "crm-resource-owners",
+                   "Source": app.SOURCE_NAME, "InstanceId": "i-000000000deadbeef"}]
+    }
+    table.delete_item.side_effect = Exception("ConditionalCheckFailed")
+    mock_resource.return_value.Table.return_value = table
+
+    result = app.handler({}, None)
+
+    assert result["prunedCerts"] == 0
+    assert result["newCerts"] == 1, "a failed prune must not stop the discovery write"
+
+
+@patch("boto3.resource")
+@patch("boto3.client")
+def test_an_in_place_update_corrects_the_owner_type_and_status_of_an_older_row(mock_client, mock_resource):
+    """Rows written under the old "active"/"expiring-soon" vocabulary, or before
+    CertType/InstanceId existed, must be corrected on the next cycle rather than
+    staying wrong until someone deletes them by hand."""
+    ssm, _ = _clients(mock_client)
+    ssm.get_parameter.return_value = {"Parameter": {"Value": INSTANCE_ID}}
+    ssm.send_command.return_value = {"Command": {"CommandId": "cmd-1"}}
+    ssm.get_command_invocation.return_value = _success_invocation(
+        _cert_block(path=f"{app.APP_CERT_DIR}/payments.pem", not_after="Jan  1 00:00:00 2030 GMT")
+    )
+
+    cert_id = app._compute_cert_id("0a1b2c3d4e5f6071", INSTANCE_ID)
+    table = MagicMock()
+    table.query.return_value = {
+        "Items": [{
+            "CertId": cert_id, "OwnerId": "some-cognito-sub", "Source": app.SOURCE_NAME,
+            "ExpiryDate": "2030-01-01T00:00:00+00:00", "Status": "active",
+        }]
+    }
+    mock_resource.return_value.Table.return_value = table
+
+    app.handler({}, None)
+
+    values = table.update_item.call_args.kwargs["ExpressionAttributeValues"]
+    assert values[":status"] == "ISSUED"
+    assert values[":ownerId"] == "crm-resource-owners"
+    assert values[":certType"] == app.CERT_TYPE_APP
+    assert values[":instanceId"] == INSTANCE_ID

@@ -109,54 +109,106 @@ aws lambda invoke --function-name app-d9fae51c-1929cc69-discovery-acm-fn \
   /tmp/discovery-acm-invoke.json \
   || echo "warning: discovery-acm-fn invocation failed — cert-inventory may be empty until the next scheduled run" >&2
 
-# --- Confirm the EC2 OS-certificate discovery path works once, right after deploy ---
+# --- Confirm the EC2 certificate discovery path works once, right after deploy ---
 # Same reasoning as above: don't wait for Ec2DiscoveryScheduleRule's first
-# 30-minute tick to find out the SSM dispatch is broken. A failure here must
-# never fail the deploy — the schedule retries on its own.
-aws lambda invoke --function-name app-d9fae51c-1929cc69-ec2-discovery-fn \
-  --region "$REGION" --cli-binary-format raw-in-base64-out --payload '{}' \
-  /tmp/ec2-discovery-invoke.json \
-  || echo "warning: ec2-discovery-fn invocation failed — it will retry on the next 30-minute schedule" >&2
+# 30-minute tick to find out the SSM dispatch is broken.
+#
+# Retried, unlike the two above, because this one races the instance's own boot.
+# A new or replaced instance has to finish cloud-init (apt, then generating its
+# internal CA and signing a certificate per host) and register with SSM before a
+# scan can return anything, which takes a couple of minutes — and a single early
+# invocation reports zero certificates found, which is indistinguishable from a
+# broken scan. Give it a few minutes, and stop as soon as application
+# certificates come back.
+#
+# A failure here must never fail the deploy — the 30-minute schedule retries.
+EC2_DISCOVERY_ATTEMPTS="${EC2_DISCOVERY_ATTEMPTS:-10}"
+EC2_DISCOVERY_INTERVAL="${EC2_DISCOVERY_INTERVAL:-30}"
+for ATTEMPT in $(seq 1 "$EC2_DISCOVERY_ATTEMPTS"); do
+  if aws lambda invoke --function-name app-d9fae51c-1929cc69-ec2-discovery-fn \
+       --region "$REGION" --cli-binary-format raw-in-base64-out --payload '{}' \
+       /tmp/ec2-discovery-invoke.json >/dev/null; then
+    APP_CERTS="$(jq -r '.appCerts // 0' /tmp/ec2-discovery-invoke.json 2>/dev/null || echo 0)"
+    if [ "$APP_CERTS" != "0" ] && [ "$APP_CERTS" != "null" ]; then
+      echo "ec2-discovery-fn found $APP_CERTS application certificate(s) on attempt $ATTEMPT"
+      break
+    fi
+    echo "ec2-discovery-fn returned no application certificates (attempt $ATTEMPT/$EC2_DISCOVERY_ATTEMPTS) — the instance is probably still issuing them"
+  else
+    echo "warning: ec2-discovery-fn invocation failed (attempt $ATTEMPT/$EC2_DISCOVERY_ATTEMPTS)" >&2
+  fi
+  [ "$ATTEMPT" -lt "$EC2_DISCOVERY_ATTEMPTS" ] && sleep "$EC2_DISCOVERY_INTERVAL"
+done
+if [ "${APP_CERTS:-0}" = "0" ]; then
+  echo "warning: no application certificates discovered from the cert-scanner instance yet — it will retry on the next 30-minute schedule" >&2
+fi
 
 # --- Seed demo inventory rows the UI can render and act on ---------------------
-# Discovery and the API disagree about what OwnerId means: discovery derives it
-# from an IAM path or a resource tag, while GET /certs and GET /iam/accounts
-# query OwnerIndex with the caller's Cognito `sub`. So genuinely discovered rows
-# belong to no human login and appear in nobody's UI. These rows are written
-# against a known sub so the dashboard has data and every control (Renew, Rotate,
-# Details, Request Password Reset) can be exercised end to end.
+# ONE seed, into the SHARED TEAM PARTITION (crm-resource-owners). OwnerId is
+# OwnerIndex's HASH key and GET /certs reads that partition for every
+# authenticated caller, so one seed serves the whole team.
 #
-# Override the target login and the volume without editing this file:
-#   SEED_OWNER_ID=<your-cognito-sub> SEED_CERTS=200 ./deploy.sh
+# This used to seed each known Cognito sub separately, with different volumes per
+# sub — which is exactly why members signed into the same CRM saw different
+# certificates, or none at all. Genuinely discovered rows had the same problem
+# from the other direction: discovery derives OwnerId from an IAM path, a resource
+# tag or the scanner's own identity, never from a Cognito sub, so they belonged to
+# no login either. Both now write the shared partition.
+#
+# Override the volume without editing this file:
+#   SEED_CERTS=200 ./deploy.sh
+# SEED_OWNER_ID still targets a single sub instead, but only do that to reproduce
+# the per-login isolation described above.
 #
 # Seeding must never abort an otherwise-successful deploy — every id starts with
 # `demo-` and every write is an idempotent upsert, so a retry is always safe.
 SEED_CERTS="${SEED_CERTS:-40}"
 SEED_ACCOUNTS="${SEED_ACCOUNTS:-15}"
 SEED_AUDIT_EVENTS="${SEED_AUDIT_EVENTS:-30}"
+SEED_OWNER_ID="${SEED_OWNER_ID:-crm-resource-owners}"
+
+# Retire rows left owned by an individual login. Demo ids are deterministic and a
+# --clean pass is keyed on the id alone, so cleaning these subs and then seeding
+# the shared partition below leaves exactly one copy of each row, owned by the
+# whole team. Without it every member keeps seeing their own private leftovers on
+# top of the shared inventory — the same inconsistency in a quieter form.
+# Generous counts, because the two subs were seeded with different volumes (40
+# and 3), and removing a key that does not exist is a no-op.
+LEGACY_SEEDED_SUBS=(
+  "d9ca551c-d0a1-7011-1c4f-99a48c8d917f"
+  "c90a255c-3071-708a-2806-987b385b1376"
+)
+if [ "${SEED_DEMO_DATA:-true}" = "true" ]; then
+  for LEGACY_SUB in "${LEGACY_SEEDED_SUBS[@]}"; do
+    REGION="$REGION" ./scripts/seed-demo-data.sh --clean \
+      --owner-id "$LEGACY_SUB" \
+      --certs 250 --accounts 60 --audit-events 120 \
+      || echo "warning: could not retire per-login demo rows for $LEGACY_SUB" >&2
+  done
+fi
 
 if [ "${SEED_DEMO_DATA:-true}" = "true" ]; then
-  REGION="$REGION" SEED_OWNER_ID="${SEED_OWNER_ID:-}" ./scripts/seed-demo-data.sh \
+  REGION="$REGION" SEED_OWNER_ID="$SEED_OWNER_ID" ./scripts/seed-demo-data.sh \
     --certs "$SEED_CERTS" \
     --accounts "$SEED_ACCOUNTS" \
     --audit-events "$SEED_AUDIT_EVENTS" \
     || echo "warning: demo data seeding failed — the UI may show no rows until it is re-run" >&2
 fi
 
-# --- Seed a second known login (sihaochow@gmail.com, sub c90a255c-3071-708a-2806-987b385b1376) ---
-# Same mechanism as above, against a second Cognito sub, so that login also has
-# rows without anyone needing to override SEED_OWNER_ID. Just 3 certs, one per
-# expiry colour band (red/amber/green), which is all a smoke test needs.
-SEED_EXTRA_OWNER_ID="${SEED_EXTRA_OWNER_ID:-c90a255c-3071-708a-2806-987b385b1376}"
-SEED_EXTRA_CERTS="${SEED_EXTRA_CERTS:-3}"
-
-if [ "${SEED_DEMO_DATA:-true}" = "true" ] && [ -n "$SEED_EXTRA_OWNER_ID" ]; then
-  REGION="$REGION" ./scripts/seed-demo-data.sh \
-    --owner-id "$SEED_EXTRA_OWNER_ID" \
-    --certs "$SEED_EXTRA_CERTS" \
-    --accounts 0 \
-    --audit-events 0 \
-    || echo "warning: demo data seeding failed for $SEED_EXTRA_OWNER_ID" >&2
+# --- Retire the five fixed rows an earlier deploy.sh left behind ----------------
+# A previous version of this script wrote cert-001/002/003 and hash-acct-001/002
+# with hand-written put-item calls, owned by one Cognito sub, carrying hardcoded
+# 2025 dates and a status vocabulary ("active"/"warning"/"critical") that no query
+# in this application uses. That script is gone (commit 6e12d0d) but its rows are
+# not: nothing owns them, nothing updates them, and they appear in one member's
+# dashboard and nobody else's.
+#
+# Named individually rather than matched by prefix, so this can never reach a
+# discovered or seeded row. Handled by the same generator as everything else, so
+# there are no ad-hoc delete calls in this script.
+if [ "${SEED_DEMO_DATA:-true}" = "true" ]; then
+  REGION="$REGION" ./scripts/seed-demo-data.sh --retire-legacy-fixed-rows \
+    || echo "warning: could not retire the legacy fixed demo rows" >&2
 fi
 
 # --- Sync the static self-service UI to S3 and invalidate the CloudFront cache ---

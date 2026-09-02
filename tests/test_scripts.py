@@ -153,20 +153,77 @@ def test_seed_volume_and_owner_are_overridable_without_editing_the_script():
         assert var in code, f"{var} must be settable from the environment"
 
 
-def test_deploy_also_seeds_the_second_known_login():
-    """sihaochow@gmail.com's sub (c90a255c-3071-708a-2806-987b385b1376) has no
-    rows unless deploy.sh seeds it directly — it's not the default
-    SEED_OWNER_ID, and asking every deploy to override that default would
-    silently drop the primary demo login's rows instead of adding a second."""
+def test_deploy_seeds_one_shared_partition_not_a_copy_per_login():
+    """The reported bug: team members signed into the same CRM saw different
+    certificates, or none.
+
+    OwnerId is OwnerIndex's HASH key, so seeding it with a Cognito sub gives that
+    one login a private dashboard. deploy.sh used to do exactly that, twice, with
+    different volumes per sub (40 certs for one, 3 for the other). There must be
+    exactly one seeding call now, and it must target the shared partition.
+    """
     code = _without_comments(DEPLOY)
-    assert "c90a255c-3071-708a-2806-987b385b1376" in code
-    assert code.count("scripts/seed-demo-data.sh") == 2, (
-        "the extra login must go through the same seeder script, as a second call"
+    assert 'SEED_OWNER_ID="${SEED_OWNER_ID:-crm-resource-owners}"' in code, (
+        "the seed must default to the shared team partition every login reads"
     )
-    second_call = code[code.rindex("scripts/seed-demo-data.sh"):][:400]
-    assert "||" in second_call, "the extra seeding call must warn and continue, not exit non-zero"
-    assert "SEED_EXTRA_OWNER_ID" in code and "SEED_EXTRA_CERTS" in code, (
-        "must be overridable from the environment, like the primary seed call"
+    seed_calls = [
+        line for line in code.splitlines()
+        if "scripts/seed-demo-data.sh" in line and "--clean" not in line
+        and "--retire-legacy-fixed-rows" not in line
+    ]
+    assert len(seed_calls) == 1, f"expected one seeding call, found {len(seed_calls)}: {seed_calls}"
+    assert "SEED_EXTRA_OWNER_ID" not in code, (
+        "seeding a second individual login is the bug, not a feature"
+    )
+
+
+def test_deploy_retires_the_rows_left_owned_by_an_individual_login():
+    """Cleaning is what stops each member seeing their own private leftovers on
+    top of the shared inventory — the same inconsistency in a quieter form. Demo
+    ids are deterministic, so clean-then-seed leaves exactly one copy of each row."""
+    code = _without_comments(DEPLOY)
+    for sub in ("d9ca551c-d0a1-7011-1c4f-99a48c8d917f", "c90a255c-3071-708a-2806-987b385b1376"):
+        assert sub in code, f"{sub} was seeded per-login and must be retired"
+    assert "--clean" in code
+    assert code.index("--clean") < code.rindex('--certs "$SEED_CERTS"'), (
+        "the per-login rows must be cleaned BEFORE the shared partition is seeded, "
+        "or the clean removes what was just written"
+    )
+
+
+def test_deploy_retires_the_fixed_rows_an_earlier_script_left_behind():
+    """cert-001/002/003 and hash-acct-001/002 were written by a deploy.sh that no
+    longer exists (commit 6e12d0d). Nothing owns them, nothing updates them, and
+    they carry a status vocabulary no query in this application uses."""
+    code = _without_comments(DEPLOY)
+    assert "--retire-legacy-fixed-rows" in code
+    call = code[code.index("--retire-legacy-fixed-rows"):][:300]
+    assert "||" in call, "retiring the legacy rows must warn and continue, not exit non-zero"
+
+
+def test_legacy_row_retirement_names_ids_individually_rather_than_by_prefix():
+    """These ids lack the `demo-` prefix that makes every other id in the seeding
+    path safe to match by pattern. An id-by-id list cannot widen into something
+    that reaches a genuinely discovered certificate."""
+    generator = (ROOT / "scripts" / "gen_demo_data.py").read_text()
+    assert 'LEGACY_FIXED_CERT_IDS = ("cert-001", "cert-002", "cert-003")' in generator
+    assert 'LEGACY_FIXED_ACCOUNT_IDS = ("hash-acct-001", "hash-acct-002")' in generator
+    # And no ad-hoc delete calls in the shell path, which is what would let this
+    # widen: everything goes through the generator's DeleteRequests.
+    assert "delete-item" not in _without_comments(DEPLOY)
+    assert "delete-item" not in _without_comments((ROOT / "scripts" / "seed-demo-data.sh").read_text())
+
+
+def test_deploy_retries_ec2_discovery_because_it_races_the_instance_boot():
+    """A new or replaced instance has to finish cloud-init, generate its internal
+    CA and sign a certificate per host, then register with SSM. A single early
+    invocation returns zero certificates, which is indistinguishable from a broken
+    scan."""
+    code = _without_comments(DEPLOY)
+    assert "EC2_DISCOVERY_ATTEMPTS" in code
+    assert "appCerts" in code, (
+        "the retry must key on application certificates specifically — the trust "
+        "store yields rows even when the certificate-issuing step failed"
     )
 
 

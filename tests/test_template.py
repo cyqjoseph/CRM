@@ -413,3 +413,83 @@ def test_api_audit_can_describe_every_state_machine_it_is_asked_about():
             f"api-audit-fn cannot DescribeExecution on {name} — polling one of its "
             "executions returns AccessDenied, which looks like a failed execution"
         )
+
+
+# ---------------------------------------------------------------------------
+# Shared ownership and the certificate lifecycle on the scanner instance
+# ---------------------------------------------------------------------------
+
+
+def test_every_function_agrees_on_the_shared_owner_partition():
+    """OwnerId is OwnerIndex's HASH key, so readers and writers must agree on the
+    value or the readers find nothing. This is the setting that decides whether
+    the whole team sees one inventory or each member sees a private one."""
+    assert TEMPLATE["Globals"]["Function"]["Environment"]["Variables"]["SHARED_OWNER_ID"] == "crm-resource-owners"
+    ec2_env = RESOURCES["Ec2DiscoveryFunction"]["Properties"]["Environment"]["Variables"]
+    assert ec2_env["OWNER_ID"] == "crm-resource-owners"
+
+
+def test_api_audit_can_check_whether_an_entity_is_a_shared_inventory_resource():
+    """Renewal/rotation events hang off a CertId or AccountIdHash, so without
+    these reads a non-admin could only ever see their own actor events."""
+    props = RESOURCES["ApiAuditFunction"]["Properties"]
+    env = props["Environment"]["Variables"]
+    assert env["CERT_TABLE_NAME"] == {"Fn::Ref": "CertInventoryTable"}
+    assert env["IAM_TABLE_NAME"] == {"Fn::Ref": "IamAccountsTable"}
+    read_tables = [
+        policy["DynamoDBReadPolicy"]["TableName"]
+        for policy in props["Policies"]
+        if isinstance(policy, dict) and "DynamoDBReadPolicy" in policy
+    ]
+    assert {"Fn::Ref": "CertInventoryTable"} in read_tables
+    assert {"Fn::Ref": "IamAccountsTable"} in read_tables
+
+
+def test_ec2_discovery_scans_the_app_cert_directory_the_instance_writes_to():
+    """The Lambda's APP_CERT_DIR and the instance's own CERT_DIR are two separate
+    declarations of the same path; a mismatch means the scan silently finds only
+    the OS trust store."""
+    env = RESOURCES["Ec2DiscoveryFunction"]["Properties"]["Environment"]["Variables"]
+    user_data = RESOURCES["Ec2CertScannerInstance"]["Properties"]["UserData"]["Fn::Base64"]
+    assert env["APP_CERT_DIR"] == "/opt/app/certs"
+    assert f'CERT_DIR={env["APP_CERT_DIR"]}' in user_data
+
+
+def test_the_trust_store_scan_is_capped_so_it_cannot_bury_the_app_certs():
+    env = RESOURCES["Ec2DiscoveryFunction"]["Properties"]["Environment"]["Variables"]
+    assert int(env["SYSTEM_CERT_LIMIT"]) > 0
+
+
+def test_the_scanner_instance_issues_its_own_certificates_end_to_end():
+    """CA, then a CSR per host, then a signed leaf — the whole lifecycle at first
+    boot, with no manual step."""
+    user_data = RESOURCES["Ec2CertScannerInstance"]["Properties"]["UserData"]["Fn::Base64"]
+    assert "openssl req -x509" in user_data, "no internal CA is created"
+    assert "openssl req -new" in user_data, "no CSR is generated"
+    assert "openssl ca -batch" in user_data, "no CSR is signed"
+    assert "-addext \"subjectAltName=DNS:${HOST}\"" in user_data, "leaf certs need a SAN"
+
+
+def test_the_scanner_signs_certificates_that_have_already_expired():
+    """An inventory whose reason to exist is expiry tracking has to contain
+    certificates that have actually expired. `openssl ca` is used precisely
+    because it is the only one of the two that accepts -startdate/-enddate on the
+    OpenSSL 3.0 the Ubuntu 22.04 AMI ships."""
+    user_data = RESOURCES["Ec2CertScannerInstance"]["Properties"]["UserData"]["Fn::Base64"]
+    assert "-startdate" in user_data and "-enddate" in user_data
+    spec_block = user_data[user_data.index("APP_CERT_SPEC="):user_data.index("ISSUED=0")]
+    offsets = [int(line.rsplit(":", 1)[1]) for line in spec_block.splitlines() if ":" in line and line.strip().endswith(tuple("0123456789"))]
+    assert any(days < 0 for days in offsets), f"no already-expired certificate: {offsets}"
+    assert any(0 < days <= 7 for days in offsets), f"no cert in the red band: {offsets}"
+    assert any(7 < days <= 30 for days in offsets), f"no cert in the amber band: {offsets}"
+    assert any(days > 30 for days in offsets), f"no cert in the green band: {offsets}"
+
+
+def test_the_private_keys_the_scanner_generates_are_not_in_the_scanned_directory():
+    """The scan reads every *.pem/*.crt under APP_CERT_DIR and the parsed text goes
+    to CloudWatch. Private keys must live somewhere else entirely."""
+    user_data = RESOURCES["Ec2CertScannerInstance"]["Properties"]["UserData"]["Fn::Base64"]
+    assert 'KEY="$CA_DIR/private/${HOST}.key"' in user_data
+    assert "CA_DIR=/opt/app/ca" in user_data
+    assert "CERT_DIR=/opt/app/certs" in user_data
+    assert not "/opt/app/certs".startswith("/opt/app/ca/"), "key dir must not be inside the scanned dir"

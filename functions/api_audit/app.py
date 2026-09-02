@@ -1,7 +1,10 @@
 """api-audit-fn: GET /audit and GET /executions/{executionId}.
 
-Cross-owner audit queries (no entityId scoping to the caller) require the
-caller to be in the Cognito admin group.
+A non-admin may read the trail for their own actor id, for the shared team
+partition, and for any certificate or account in the shared inventory — the
+whole team owns those assets, so the audit trail for a shared cert has to be
+readable by whoever clicked Renew on it. Anything else (another login's actor
+id, a row owned by a different sub) still requires the Cognito admin group.
 """
 import os
 import traceback
@@ -9,12 +12,14 @@ from urllib.parse import unquote
 
 import boto3
 from crm_common import (
+    SHARED_OWNER_ID,
     api_response,
     get_claims,
     guard_api_handler,
     is_admin,
     new_request_id,
     now_iso,
+    can_view,
     owner_id_of,
     request_headers,
     request_origin,
@@ -23,6 +28,43 @@ from crm_common import (
 )
 
 AUDIT_TABLE_NAME = os.environ["AUDIT_TABLE_NAME"]
+# Read-only, and only to answer "is this entity id a shared team asset?" — see
+# _is_shared_inventory_entity below.
+CERT_TABLE_NAME = os.environ.get("CERT_TABLE_NAME", "")
+IAM_TABLE_NAME = os.environ.get("IAM_TABLE_NAME", "")
+
+
+def _is_shared_inventory_entity(entity_id, claims, request_id):
+    """Whether `entity_id` names a certificate or account in the shared inventory.
+
+    An audit EntityId is either an actor id (a Cognito sub) or the id of the
+    resource acted on. The resource case is the one that matters here: renewal
+    and rotation events hang off a CertId/AccountIdHash, so without this lookup
+    the audit tab could only ever show a caller their own actor events and the
+    "check the audit tab for details" the UI prints after a failed renewal was
+    advice only an admin could act on.
+    """
+    lookups = (
+        (CERT_TABLE_NAME, "CertId"),
+        (IAM_TABLE_NAME, "AccountIdHash"),
+    )
+    dynamodb = boto3.resource("dynamodb")
+    for table_name, key_name in lookups:
+        if not table_name:
+            continue
+        try:
+            item = dynamodb.Table(table_name).get_item(Key={key_name: entity_id}).get("Item")
+        except Exception:
+            # A denied or failing lookup must not turn a legitimate query into a
+            # 500 — fall through and let the caller-scoping rule decide.
+            structured_log(
+                request_id, "shared_inventory_lookup_failed", level="WARN",
+                function="api-audit", table=table_name, entityId=entity_id,
+            )
+            continue
+        if item and can_view(item, claims):
+            return True
+    return False
 
 
 def _get_audit(table, claims, query_params, request_id):
@@ -36,9 +78,19 @@ def _get_audit(table, claims, query_params, request_id):
 
     if not entity_id:
         return api_response(400, {"message": "entityId is required"})
-    if entity_id != owner_id_of(claims) and not is_admin(claims):
-        # A non-admin may only look up their own actor id; anything else is
-        # a cross-owner query and requires the admin group.
+    allowed = (
+        is_admin(claims)
+        or entity_id == owner_id_of(claims)
+        or entity_id == SHARED_OWNER_ID
+        or _is_shared_inventory_entity(entity_id, claims, request_id)
+    )
+    if not allowed:
+        # Not the caller's own actor id, not the shared team partition, and not a
+        # shared inventory resource — a genuine cross-owner query, admin only.
+        structured_log(
+            request_id, "audit_forbidden", level="WARN", function="api-audit",
+            entityId=entity_id,
+        )
         return api_response(403, {"message": "forbidden"})
 
     key_condition = "EntityId = :entityId"

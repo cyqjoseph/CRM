@@ -31,6 +31,14 @@ Globals:
         CORS_ALLOW_ORIGIN: "*"
         CORS_ALLOW_METHODS: "GET, POST, OPTIONS"
         CORS_ALLOW_HEADERS: "Content-Type, Authorization"
+        # The OwnerId partition every CRM login can read. OwnerId is OwnerIndex's
+        # HASH key, so its value is what decides who sees a row: a per-Cognito-sub
+        # value gave each team member a private dashboard and showed every
+        # discovered row to nobody. Declared here because both the readers (the
+        # API functions) and the writers (discovery, the seeder) must agree on it.
+        # Kept in step with crm_common.SHARED_OWNER_ID and
+        # scripts/gen_demo_data.py's SHARED_OWNER_ID.
+        SHARED_OWNER_ID: crm-resource-owners
     Layers:
       - !Ref CommonLayer
 
@@ -564,7 +572,18 @@ Resources:
         Variables:
           EC2_INSTANCE_ID_PARAM: !Ref Ec2CertScannerInstanceIdParam
           CERT_TABLE: !Ref CertInventoryTable
+          # The shared team partition, so every login sees what the scanner finds.
+          # This value was already correct; what made these rows invisible was the
+          # API querying OwnerIndex with the caller's Cognito sub instead.
           OWNER_ID: crm-resource-owners
+          # Where Ec2CertScannerInstance's UserData installs the certificates it
+          # issues (internal CA -> CSR -> signed leaf). Scanned in full.
+          APP_CERT_DIR: /opt/app/certs
+          # The OS trust store. Real certificates worth tracking, but ~140 of them
+          # on Ubuntu, so it is capped rather than allowed to bury the application
+          # certificates above.
+          SYSTEM_CERT_DIR: /etc/ssl/certs
+          SYSTEM_CERT_LIMIT: "50"
       Policies:
         - Statement:
             - Effect: Allow
@@ -820,9 +839,21 @@ Resources:
       Environment:
         Variables:
           AUDIT_TABLE_NAME: !Ref AuditHotTable
+          # Read-only, and used for one question: is this entityId a certificate or
+          # account in the shared inventory? Renewal and rotation events hang off a
+          # CertId/AccountIdHash, so without this lookup the audit tab could only
+          # ever show a caller their own actor events — and the "check the audit tab
+          # for details" the UI prints after a failed renewal was advice only an
+          # admin could act on.
+          CERT_TABLE_NAME: !Ref CertInventoryTable
+          IAM_TABLE_NAME: !Ref IamAccountsTable
       Policies:
         - DynamoDBReadPolicy:
             TableName: !Ref AuditHotTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref CertInventoryTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref IamAccountsTable
         - Statement:
             - Effect: Allow
               Action:
@@ -1344,11 +1375,123 @@ Resources:
           CERTS_DIR_STATUS="missing"
           [ -d /etc/ssl/certs ] && CERTS_DIR_STATUS="present"
 
+          # --- Application certificates: internal CA, one CSR and signed leaf per host ---
+          # This is the whole certificate lifecycle, run locally at first boot with
+          # no intervention from anyone: generate a CA, generate a private key and
+          # a CSR per service hostname, sign each CSR with the CA, install the
+          # signed leaf where ec2-discovery-fn's scan will find it (APP_CERT_DIR).
+          #
+          # `openssl ca` rather than `openssl x509 -req`: only the former accepts
+          # -startdate/-enddate on OpenSSL 3.0 (which is what Ubuntu 22.04 ships),
+          # and backdating is the point — an inventory whose reason to exist is
+          # expiry tracking has to contain certificates that have actually expired,
+          # not just ones that will.
+          CA_DIR=/opt/app/ca
+          CERT_DIR=/opt/app/certs
+          mkdir -p "$CA_DIR/newcerts" "$CA_DIR/private" "$CA_DIR/csr" "$CERT_DIR"
+          chmod 700 "$CA_DIR/private"
+          chmod 755 "$CERT_DIR"
+
+          cat > "$CA_DIR/openssl.cnf" <<'CACONF'
+          [ ca ]
+          default_ca = CA_default
+
+          [ CA_default ]
+          dir             = /opt/app/ca
+          new_certs_dir   = /opt/app/ca/newcerts
+          database        = /opt/app/ca/index.txt
+          serial          = /opt/app/ca/serial
+          private_key     = /opt/app/ca/private/ca.key
+          certificate     = /opt/app/ca/ca.crt
+          default_md      = sha256
+          policy          = policy_any
+          email_in_dn     = no
+          rand_serial     = no
+          # Carries the subjectAltName from the CSR into the signed certificate,
+          # so no separate -extfile is needed per host.
+          copy_extensions = copy
+
+          [ policy_any ]
+          commonName             = supplied
+          countryName            = optional
+          stateOrProvinceName    = optional
+          organizationName       = optional
+          organizationalUnitName = optional
+          emailAddress           = optional
+          CACONF
+
+          if [ ! -f "$CA_DIR/ca.crt" ]; then
+            : > "$CA_DIR/index.txt"
+            # `openssl ca` reads unique_subject from the database's .attr file, NOT
+            # from openssl.cnf. Left to its default (yes) it refuses to re-sign a CN
+            # it has signed before, so a second pass issues nothing while still
+            # exiting 0 — a failure that looks exactly like success.
+            echo "unique_subject = no" > "$CA_DIR/index.txt.attr"
+            echo 1000 > "$CA_DIR/serial"
+            openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 3650 \
+              -keyout "$CA_DIR/private/ca.key" -out "$CA_DIR/ca.crt" \
+              -subj "/C=SG/O=app-d9fae51c-1929cc69/CN=app-d9fae51c-1929cc69 Internal CA"
+            chmod 600 "$CA_DIR/private/ca.key"
+          fi
+
+          # The CA's own certificate belongs in the inventory too — it is a real
+          # certificate on this instance, and it is the one whose expiry invalidates
+          # every leaf below it.
+          cp "$CA_DIR/ca.crt" "$CERT_DIR/internal-ca.pem"
+
+          # host:days-until-expiry. Negative means already expired. Chosen to cover
+          # every band the dashboard renders: expired, <=7d, <=30d, and beyond.
+          APP_CERT_SPEC="payments.internal.example.com:-30
+          metrics.svc.example.io:-3
+          vpn.internal.example.com:2
+          sso.internal.example.com:5
+          api.internal.example.com:21
+          mail.example.com:45
+          checkout.svc.example.io:120
+          gateway.corp.example.net:300"
+
+          ISSUED=0
+          FAILED=0
+          for SPEC in $APP_CERT_SPEC; do
+            HOST="${SPEC%:*}"
+            DAYS="${SPEC##*:}"
+            KEY="$CA_DIR/private/${HOST}.key"
+            CSR="$CA_DIR/csr/${HOST}.csr"
+            LEAF="$CERT_DIR/${HOST}.pem"
+
+            # A one-year validity window ending at the offset above, so an expired
+            # certificate reads as one that was issued and lapsed rather than one
+            # that was never valid at all.
+            END=$(date -u -d "${DAYS} days" +%Y%m%d%H%M%SZ)
+            START=$(date -u -d "$((DAYS - 365)) days" +%Y%m%d%H%M%SZ)
+
+            if openssl req -new -newkey rsa:2048 -nodes -sha256 \
+                 -keyout "$KEY" -out "$CSR" \
+                 -subj "/C=SG/O=app-d9fae51c-1929cc69/OU=CRM/CN=${HOST}" \
+                 -addext "subjectAltName=DNS:${HOST}" 2>/dev/null \
+               && openssl ca -batch -config "$CA_DIR/openssl.cnf" -notext \
+                    -startdate "$START" -enddate "$END" \
+                    -in "$CSR" -out "$LEAF" 2>/dev/null; then
+              chmod 600 "$KEY"
+              chmod 644 "$LEAF"
+              ISSUED=$((ISSUED + 1))
+            else
+              FAILED=$((FAILED + 1))
+              rm -f "$LEAF"
+            fi
+          done
+
+          # A marker the discovery Lambda's operator can check: distinguishes "the
+          # boot script has not finished yet" from "the boot script failed", which
+          # otherwise look identical from an empty certificate directory.
+          printf 'issued=%s failed=%s at=%s\n' "$ISSUED" "$FAILED" "$(date -u +%FT%TZ)" \
+            > /opt/app/cert-issuance-status
+
           aws logs create-log-stream --region "$REGION" \
             --log-group-name "$LOG_GROUP" --log-stream-name "$LOG_STREAM" 2>/dev/null || true
 
           TS=$(($(date +%s%N)/1000000))
-          MESSAGE="cert-scanner instance launched successfully: instance-id=$INSTANCE_ID public-ip=$PUBLIC_IP /etc/ssl/certs=$CERTS_DIR_STATUS"
+          MESSAGE="cert-scanner instance launched successfully: instance-id=$INSTANCE_ID public-ip=$PUBLIC_IP /etc/ssl/certs=$CERTS_DIR_STATUS app-certs-issued=$ISSUED app-certs-failed=$FAILED"
           aws logs put-log-events --region "$REGION" \
             --log-group-name "$LOG_GROUP" --log-stream-name "$LOG_STREAM" \
             --log-events "[{\"timestamp\": $TS, \"message\": \"$MESSAGE\"}]" || true

@@ -124,7 +124,8 @@ All infrastructure is in `template.yaml` (AWS SAM). Shared Lambda code lives in
 `deploy.sh` is idempotent and writes `outputs.json` (including `app_url`) at the
 repo root. It also invokes all three discovery Lambdas (`discovery-iam-fn`,
 `discovery-acm-fn`, `ec2-discovery-fn`) once so the tables/logs have data
-immediately instead of waiting for their schedules.
+immediately instead of waiting for their schedules — `ec2-discovery-fn` with
+retries, since it races the scanner instance's first boot.
 
 ### Generating demo data
 
@@ -132,16 +133,22 @@ immediately instead of waiting for their schedules.
 ./scripts/seed-demo-data.sh                            # 40 certs, 15 accounts, 30 audit events
 ./scripts/seed-demo-data.sh --certs 200 --accounts 50  # more of it
 ./scripts/seed-demo-data.sh --clean                    # remove it again
-SEED_OWNER_ID=<your-cognito-sub> ./scripts/seed-demo-data.sh
+./scripts/seed-demo-data.sh --retire-legacy-fixed-rows # drop the pre-generator rows
+SEED_OWNER_ID=<a-cognito-sub> ./scripts/seed-demo-data.sh   # one private login, to reproduce the old bug
 ```
 
 `deploy.sh` runs this automatically; override the volume with `SEED_CERTS`,
 `SEED_ACCOUNTS`, `SEED_AUDIT_EVENTS`, or skip it with `SEED_DEMO_DATA=false`.
 
-Rows are generated to exercise the UI rather than merely populate it: expiry
-dates are spread so every colour band is represented, ~1 in 6 certificates
-carries a non-`ISSUED` status so the `ExpiryIndex` filter has something to
-exclude, and ~1 in 4 accounts is `warning`/`critical`. Every id starts with
+Rows go to the shared `crm-resource-owners` partition by default, so every login
+sees them — see "One shared inventory, not one per login" below.
+
+They are generated to exercise the UI rather than merely populate it: expiry
+dates cover every band including **already expired**, each row's status agrees
+with its own date, a minority are `REVOKED`/`PENDING_VALIDATION` so the
+`ExpiryIndex` filter has something to exclude, some accounts are overdue for
+rotation (and still `active`, which is exactly what `expiry-evaluator-fn` must
+alert on), and ~1 in 4 accounts is `warning`/`critical`. Every id starts with
 `demo-`, and `--clean` deletes exactly those ids, so it can never remove a
 genuinely discovered resource. Generation is deterministic, so a re-run upserts
 the same rows rather than duplicating them.
@@ -208,29 +215,123 @@ relabels the button and reloads the table (so the new `ExpiryDate`/`Status`
 shows) or surfaces the failing state name. A stuck execution times out rather
 than disabling the button forever.
 
-### An empty Certificates tab is normal, not a fault
+### One shared inventory, not one per login
 
-Discovery and the API disagree about what `OwnerId` means:
+`OwnerId` is `OwnerIndex`'s HASH key, which makes its value the entire
+access-control story for an inventory row — and the writers and the readers used
+to disagree about what it meant:
 
-| | writes/reads `OwnerId` as |
+| | wrote/read `OwnerId` as |
 |---|---|
 | `discovery_acm` (IAM server certs) | the certificate's `Path` |
 | `discovery_acm` (Secrets Manager) | the `crm:owner-id` tag |
 | `discovery_iam` | the IAM user's `Path` |
-| `GET /certs`, `GET /iam/accounts` | the caller's Cognito `sub` (a UUID) |
+| `ec2_discovery` | the scanner's own service identity |
+| `GET /certs`, `GET /iam/accounts` | **the caller's Cognito `sub`** |
 
-Both index the same `OwnerIndex` GSI, so a perfectly healthy discovery run writes
-rows that belong to no human login and appear in **nobody's** dashboard.
+So a healthy discovery run wrote rows that belonged to no human login and
+appeared in nobody's dashboard, while `deploy.sh` seeded a separate private copy
+per known `sub` — with different volumes each. Three members of one team signed
+into the same CRM and saw three different dashboards, or none.
 
-`deploy.sh` therefore seeds demo rows against `SEED_OWNER_ID` (override it with
-your own Cognito `sub` — find it in any `api-certs-fn` log line's `ownerId`
-field after signing in once). Reconciling the two meanings properly — mapping a
-discovered resource to an owning user — is left open.
+The project team shares its assets, so there is now one shared partition,
+`crm-resource-owners`, declared in exactly one place per layer and asserted equal
+across them by the tests:
 
-Two traps make hand-seeding error-prone: `ExpiryDate` and `NextRotationDate` are
-`OwnerIndex`'s RANGE key, and DynamoDB silently omits an item lacking one from
-the index (accepted on write, never returned by `GET /certs`); and the IAM tab
-renders `Status` and `UserName`, not `RotationStatus`.
+- `crm_common.SHARED_OWNER_ID` — the Lambdas
+- `SHARED_OWNER_ID` in `Globals.Function.Environment.Variables` — the template
+- `Ec2DiscoveryFunction`'s `OWNER_ID` — the scanner
+- `gen_demo_data.SHARED_OWNER_ID` — the seeder (stdlib-only, so it duplicates
+  the value rather than importing it; `test_gen_demo_data.py` checks the copy)
+
+`GET /certs` and `GET /iam/accounts` read the shared partition **plus** anything
+still owned by the caller's own `sub`, de-duplicated by primary key and sorted by
+soonest expiry — so rows seeded per-login before this change do not vanish. An
+admin can still scope a listing to one owner with `?ownerId=`. `GET /audit` lets
+any caller read the shared partition's trail and the trail of any certificate or
+account **in** the shared inventory, which is what makes the "check the audit tab
+for details" the UI prints after a failed renewal actionable by the person who
+clicked the button.
+
+Retiring the old rows is part of `deploy.sh`, because leaving them is the same
+inconsistency in a quieter form — every member keeps seeing private leftovers on
+top of the shared inventory:
+
+- the two per-`sub` demo seeds are `--clean`ed (ids are deterministic, so
+  clean-then-seed leaves exactly one copy of each row, owned by the team)
+- `cert-001`/`002`/`003` and `hash-acct-001`/`002` — five fixed rows written by a
+  `deploy.sh` that no longer exists (commit `6e12d0d`), carrying hardcoded 2025
+  dates and an `active`/`warning`/`critical` status vocabulary no query in this
+  application uses — are deleted by id. They lack the `demo-` prefix that makes
+  every other id safe to match by pattern, so they are named individually and go
+  through the same generator, keeping ad-hoc `delete-item` calls out of the shell.
+
+Two traps still make hand-seeding error-prone: `ExpiryDate` and
+`NextRotationDate` are `OwnerIndex`'s RANGE key, and DynamoDB silently omits an
+item lacking one from the index (accepted on write, never returned by
+`GET /certs`); and the IAM tab renders `Status` and `UserName`, not
+`RotationStatus`.
+
+### `Status` has one vocabulary, and it agrees with the date
+
+`Status` is `ExpiryIndex`'s HASH key and `expiry-evaluator-fn` queries it with the
+literal `ISSUED`. Two separate bugs came out of ignoring that:
+
+- `ec2_discovery` wrote `active`/`expiring-soon`/`expired`. Those rows were
+  silently excluded from **every** expiry alert while looking perfectly healthy in
+  the table, and sat in the UI beside `ISSUED` rows as if they were a different
+  kind of thing. "Expiring soon" is not a status anyway — it is a distance from
+  today, which the dashboard computes from `ExpiryDate` and colours accordingly.
+- the seeder picked a status at *random*, independently of the date it had just
+  generated. Hence rows reading `ISSUED` that expired months ago, and — because
+  every generated date was in the future — an inventory whose entire reason to
+  exist is expiry tracking that could not show a single expired certificate.
+
+Now `crm_common.cert_status_for()` derives it: past → `EXPIRED`, future →
+`ISSUED`. `REVOKED` and `PENDING_VALIDATION` are set explicitly by whoever knows
+that out-of-band fact, never inferred — and `PENDING_VALIDATION` is only ever
+placed on a far-future row, since a certificate still awaiting validation has not
+been issued yet and cannot be days from expiry.
+
+### The scanner instance issues its own certificates
+
+`Ec2CertScannerInstance`'s UserData runs the whole certificate lifecycle at first
+boot, with no manual step:
+
+1. generates an internal CA (`/opt/app/ca`, 10-year self-signed root)
+2. generates a private key and a **CSR** per service hostname
+3. **signs** each CSR with that CA
+4. installs the signed leaf into `/opt/app/certs` — `APP_CERT_DIR`, what
+   `ec2-discovery-fn` scans
+
+`openssl ca`, not `openssl x509 -req`: only the former accepts `-startdate` /
+`-enddate` on the OpenSSL 3.0 the Ubuntu 22.04 AMI ships, and backdating is the
+point — the eight hosts are issued with validity windows deliberately spread
+across every band, two of them already expired. `unique_subject = no` goes in
+`index.txt.attr`, not `openssl.cnf`; left at its default, `openssl ca` refuses to
+re-sign a CN it has signed before and issues nothing while still exiting 0.
+
+`/etc/ssl/certs` is scanned too, capped at `SYSTEM_CERT_LIMIT` (50) — a root CA
+does expire, but ~140 of them would bury the application certificates. `CertType`
+distinguishes them (`EC2_APP_CERT` vs `EC2_SYSTEM_CA`) and the UI has a Type
+column, because otherwise the two are indistinguishable in one table. The
+discovery result reports `appCerts` separately for the same reason: the trust
+store yields rows even when the certificate-issuing step failed, so counting only
+the total makes a broken CA look like a successful scan.
+
+Private keys live in `/opt/app/ca/private`, deliberately outside the scanned
+directory — the scan's parsed output goes to CloudWatch.
+
+`CertId` hashes `(serial, instance id)`, so a replaced instance (any UserData or
+AMI change replaces it) means every row is a new row. `ec2-discovery-fn` therefore
+deletes rows carrying **its own** `Source` and a *different* `InstanceId`;
+otherwise each deploy leaves a full set of orphans that never update again and
+drift into `EXPIRED` with nothing on the dashboard explaining why. A row with no
+`InstanceId` predates that attribute and is left alone rather than guessed about.
+
+`deploy.sh` retries the first discovery invocation (10 attempts, 30s apart)
+because it races cloud-init: a single early call returns zero certificates, which
+is indistinguishable from a broken scan.
 
 ### Secrets Manager's recovery window blocks the next deploy
 

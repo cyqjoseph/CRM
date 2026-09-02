@@ -5,7 +5,9 @@ import traceback
 
 import boto3
 from crm_common import (
+    SHARED_OWNER_ID,
     api_response,
+    can_view,
     get_claims,
     guard_api_handler,
     is_admin,
@@ -13,10 +15,12 @@ from crm_common import (
     now_iso,
     owner_id_of,
     put_audit_event,
+    query_owner_partitions,
     request_headers,
     request_origin,
     sanitize_event_for_logging,
     structured_log,
+    visible_owner_ids,
 )
 
 CERT_TABLE_NAME = os.environ["CERT_TABLE_NAME"]
@@ -24,29 +28,36 @@ RENEWAL_STATE_MACHINE_ARN = os.environ["RENEWAL_STATE_MACHINE_ARN"]
 
 
 def _list_certs(table, claims, query_params, request_id):
+    """Every certificate this caller may see: the shared team inventory, plus
+    anything still owned by their own Cognito sub.
+
+    This used to query OwnerIndex with the caller's `sub` alone. OwnerId is that
+    index's HASH key, so a row belonged to exactly one login — three team members
+    sharing the same assets got three different dashboards, and every genuinely
+    discovered row (owned by an IAM path, a resource tag, or the scanner's
+    service identity) appeared in nobody's.
+    """
     query_params = query_params or {}
-    if is_admin(claims) and query_params.get("ownerId"):
-        owner_id = query_params["ownerId"]
-    else:
-        owner_id = owner_id_of(claims)
+    owner_override = query_params.get("ownerId") if is_admin(claims) else None
 
-    structured_log(
-        request_id, "query_params", function="api-certs", table=CERT_TABLE_NAME,
-        action="query_all_certs", ownerId=owner_id, status=query_params.get("status"),
-    )
-
-    if not owner_id:
-        # DynamoDB rejects an empty string for a key attribute, so an absent
-        # `sub` would raise ValidationException here rather than return nothing —
-        # another unhandled exception surfacing in the browser as a 502.
+    if not owner_id_of(claims):
+        # No `sub` means the request never passed the Cognito authorizer. Reject
+        # it here rather than reading the shared partition for an unidentified
+        # caller — and before any DynamoDB call, since an empty string is not a
+        # valid key value and would raise ValidationException (another 502).
         structured_log(request_id, "unauthenticated", level="WARN", function="api-certs")
         return api_response(401, {"message": "unauthenticated"})
 
+    owner_ids = [owner_override] if owner_override else visible_owner_ids(claims)
+    structured_log(
+        request_id, "query_params", function="api-certs", table=CERT_TABLE_NAME,
+        action="query_all_certs", ownerIds=owner_ids, sharedOwnerId=SHARED_OWNER_ID,
+        status=query_params.get("status"),
+    )
+
     try:
-        response = table.query(
-            IndexName="OwnerIndex",
-            KeyConditionExpression="OwnerId = :owner",
-            ExpressionAttributeValues={":owner": owner_id},
+        items = query_owner_partitions(
+            table, "OwnerIndex", "CertId", claims, owner_id_override=owner_override
         )
     except Exception:
         structured_log(
@@ -55,7 +66,6 @@ def _list_certs(table, claims, query_params, request_id):
         )
         raise
 
-    items = response.get("Items", [])
     structured_log(
         request_id, "dynamodb_response", function="api-certs", table=CERT_TABLE_NAME,
         count=len(items), firstItem=items[0] if items else None,
@@ -63,6 +73,10 @@ def _list_certs(table, claims, query_params, request_id):
 
     if query_params.get("status"):
         items = [i for i in items if i.get("Status") == query_params["status"]]
+    # Soonest expiry first. Querying several partitions loses the single
+    # partition's own ExpiryDate ordering, and the dashboard's whole point is
+    # what expires next.
+    items.sort(key=lambda i: str(i.get("ExpiryDate") or ""))
     return api_response(200, {"items": items})
 
 
@@ -80,7 +94,7 @@ def _get_cert(table, claims, cert_id, request_id):
     structured_log(request_id, "dynamodb_response", function="api-certs", table=CERT_TABLE_NAME, found=item is not None)
     if not item:
         return api_response(404, {"message": "not found"})
-    if not is_admin(claims) and item.get("OwnerId") != owner_id_of(claims):
+    if not can_view(item, claims):
         return api_response(404, {"message": "not found"})
     return api_response(200, item)
 
@@ -99,10 +113,11 @@ def _renew_cert(table, claims, cert_id, request_id):
     )
     if not item:
         return api_response(404, {"message": "not found"})
-    if not is_admin(claims) and item.get("OwnerId") != owner_id_of(claims):
+    if not can_view(item, claims):
         structured_log(
             request_id, "renew_forbidden", level="WARN", function="api-certs",
             certId=cert_id, ownerId=item.get("OwnerId"),
+            visibleOwnerIds=visible_owner_ids(claims),
         )
         return api_response(404, {"message": "not found"})
 
