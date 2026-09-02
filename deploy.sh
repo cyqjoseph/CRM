@@ -134,6 +134,22 @@ if [ "${SEED_DEMO_DATA:-true}" = "true" ]; then
     || echo "warning: demo data seeding failed — the UI may show no rows until it is re-run" >&2
 fi
 
+# --- Seed a second known login (sihaochow@gmail.com, sub c90a255c-3071-708a-2806-987b385b1376) ---
+# Same mechanism as above, against a second Cognito sub, so that login also has
+# rows without anyone needing to override SEED_OWNER_ID. Just 3 certs, one per
+# expiry colour band (red/amber/green), which is all a smoke test needs.
+SEED_EXTRA_OWNER_ID="${SEED_EXTRA_OWNER_ID:-c90a255c-3071-708a-2806-987b385b1376}"
+SEED_EXTRA_CERTS="${SEED_EXTRA_CERTS:-3}"
+
+if [ "${SEED_DEMO_DATA:-true}" = "true" ] && [ -n "$SEED_EXTRA_OWNER_ID" ]; then
+  REGION="$REGION" ./scripts/seed-demo-data.sh \
+    --owner-id "$SEED_EXTRA_OWNER_ID" \
+    --certs "$SEED_EXTRA_CERTS" \
+    --accounts 0 \
+    --audit-events 0 \
+    || echo "warning: demo data seeding failed for $SEED_EXTRA_OWNER_ID" >&2
+fi
+
 # --- Sync the static self-service UI to S3 and invalidate the CloudFront cache ---
 if [ -d "ui" ]; then
   UI_BUCKET="$(jq -r '.[] | select(.OutputKey=="UiSiteBucketName") | .OutputValue' /tmp/"${STACK_NAME}"-outputs.json)"

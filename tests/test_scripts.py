@@ -141,6 +141,23 @@ def test_seed_volume_and_owner_are_overridable_without_editing_the_script():
         assert var in code, f"{var} must be settable from the environment"
 
 
+def test_deploy_also_seeds_the_second_known_login():
+    """sihaochow@gmail.com's sub (c90a255c-3071-708a-2806-987b385b1376) has no
+    rows unless deploy.sh seeds it directly — it's not the default
+    SEED_OWNER_ID, and asking every deploy to override that default would
+    silently drop the primary demo login's rows instead of adding a second."""
+    code = _without_comments(DEPLOY)
+    assert "c90a255c-3071-708a-2806-987b385b1376" in code
+    assert code.count("scripts/seed-demo-data.sh") == 2, (
+        "the extra login must go through the same seeder script, as a second call"
+    )
+    second_call = code[code.rindex("scripts/seed-demo-data.sh"):][:400]
+    assert "||" in second_call, "the extra seeding call must warn and continue, not exit non-zero"
+    assert "SEED_EXTRA_OWNER_ID" in code and "SEED_EXTRA_CERTS" in code, (
+        "must be overridable from the environment, like the primary seed call"
+    )
+
+
 def test_seeder_only_ever_deletes_its_own_rows():
     """--clean must be incapable of removing a genuinely discovered resource."""
     seeder = (ROOT / "scripts" / "seed-demo-data.sh").read_text()
