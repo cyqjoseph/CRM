@@ -558,9 +558,13 @@ Resources:
       FunctionName: app-d9fae51c-1929cc69-ec2-discovery-fn
       CodeUri: functions/ec2_discovery/
       Handler: app.handler
+      Timeout: 60
+      MemorySize: 256
       Environment:
         Variables:
-          CERT_SCANNER_INSTANCE_ID_PARAM: !Ref Ec2CertScannerInstanceIdParam
+          EC2_INSTANCE_ID_PARAM: !Ref Ec2CertScannerInstanceIdParam
+          CERT_TABLE: !Ref CertInventoryTable
+          OWNER_ID: crm-resource-owners
       Policies:
         - Statement:
             - Effect: Allow
@@ -568,10 +572,20 @@ Resources:
               Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${Ec2CertScannerInstanceIdParam}"
         - Statement:
             - Effect: Allow
-              Action: ssm:SendCommand
+              Action:
+                - ssm:SendCommand
+                - ssm:GetCommandInvocation
               Resource:
                 - !Sub "arn:aws:ssm:${AWS::Region}::document/AWS-RunShellScript"
                 - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/${Ec2CertScannerInstance}"
+        - DynamoDBReadPolicy:
+            TableName: !Ref CertInventoryTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref CertInventoryTable
+        - Statement:
+            - Effect: Allow
+              Action: cloudwatch:PutMetricData
+              Resource: "*"
         - Statement:
             - Effect: Allow
               Action:

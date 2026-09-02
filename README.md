@@ -67,15 +67,47 @@ source for OS-level certificate discovery — the certs under its own
 inventory `discovery-acm-fn` already covers. `ec2-discovery-fn` runs on
 `Ec2DiscoveryScheduleRule` (`rate(30 minutes)`), reads the instance id from
 `/app-d9fae51c-1929cc69/ec2/cert-scanner-instance-id` in Parameter Store, and
-dispatches an `AWS-RunShellScript` SSM Run Command against it that lists every
-cert's subject and expiry. The instance carries no inbound security-group rule
-at all, SSH included — remote access is `AmazonSSMManagedInstanceCore` /
-Session Manager, over outbound 443, so there's no port to open. (The task that
-requested this instance asked for port 22 open to `0.0.0.0/0` "or restrict to
-Lambda security group if possible"; Lambda isn't VPC-attached anywhere in this
-app, so there's no such group, and SSM already satisfies the same need without
-exposing anything to the internet.) Launch success, instance id and public IP
-are logged to CloudWatch Logs (`app-d9fae51c-1929cc69-ec2-cert-scanner`) by the
+dispatches a single `AWS-RunShellScript` SSM Run Command that both enumerates
+every `*.pem` under `/etc/ssl/certs` (capped at 100) and runs
+`openssl x509 -text` against each one, wrapped in per-file markers — one
+SendCommand/GetCommandInvocation round trip for the whole instance rather than
+one per certificate. If the command doesn't reach a terminal status within 20
+seconds the dispatch is retried once; if that also doesn't complete, the run
+logs a warning and exits cleanly rather than failing the invocation.
+
+Each certificate's text is parsed for its serial number, Issuer/Subject DNs,
+validity dates and SAN DNS entries. `CertId` is `"ec2-" + sha256(serial +
+instanceId)`, so re-discovering the same certificate on the same instance
+always maps to the same row. `Domain` is the Subject CN, falling back to the
+first SAN and then the Issuer CN. `Status` is `expired` / `expiring-soon`
+(within 30 days) / `active` from `Not After`, and `CertType` is `system-ca` or
+`app-cert` depending on whether the issuer matches a known public root CA.
+Every row is written with `OwnerId=crm-resource-owners` and
+`Source=ec2-os-certs` into `cert-inventory` — reusing the existing
+`OwnerIndex` GSI to cheaply find this source's previously-discovered rows
+each cycle (no scan). A CertId already in the table has only its
+`ExpiryDate`/`Status`/`LastDiscoveredAt` updated in place; every other field
+stays as first discovered. A new CertId is inserted. Nothing is ever deleted
+here. A certificate that fails to parse is logged and skipped without
+affecting the rest of the batch; a DynamoDB write that keeps failing is
+retried up to 3 times with exponential backoff, and a final failure publishes
+a `DiscoveryFatalErrors` CloudWatch metric before re-raising so EventBridge
+retries the whole invocation once.
+
+Note: this Status vocabulary (`active`/`expiring-soon`/`expired`) is distinct
+from the `ISSUED`/`EXPIRED`/... vocabulary `discovery-acm-fn` writes and that
+`expiry-evaluator-fn`'s `ExpiryIndex` query filters on — EC2-discovered rows
+show up in the dashboard's cert list but are not (yet) wired into the
+SNS/Jira expiry-alerting pipeline, which only ever queries `Status="ISSUED"`.
+
+The instance carries no inbound security-group rule at all, SSH included —
+remote access is `AmazonSSMManagedInstanceCore` / Session Manager, over
+outbound 443, so there's no port to open. (The task that requested this
+instance asked for port 22 open to `0.0.0.0/0` "or restrict to Lambda security
+group if possible"; Lambda isn't VPC-attached anywhere in this app, so there's
+no such group, and SSM already satisfies the same need without exposing
+anything to the internet.) Launch success, instance id and public IP are
+logged to CloudWatch Logs (`app-d9fae51c-1929cc69-ec2-cert-scanner`) by the
 instance's own boot UserData.
 
 All infrastructure is in `template.yaml` (AWS SAM). Shared Lambda code lives in

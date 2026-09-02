@@ -77,6 +77,10 @@ MANDATORY_WILDCARD_ACTIONS = {
     "xray:PutTelemetryRecords",
     "xray:GetSamplingRules",
     "xray:GetSamplingTargets",
+    # CloudWatch's metric-write action accepts no resource ARN — metrics are
+    # identified by namespace/name in the request body, not an ARN. Granted to
+    # ec2-discovery-fn to publish a fatal-error count.
+    "cloudwatch:PutMetricData",
 }
 
 
